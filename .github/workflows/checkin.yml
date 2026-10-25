@@ -1,8 +1,12 @@
 name: AgentRouter Daily Check-in
 
-# 定时说明：GitHub Actions cron 使用 UTC，北京时间 = UTC+8
+# 时间说明：GitHub Actions cron 用 UTC，北京时间 = UTC+8
 #   3 19 * * *  -> 次日 03:03（北京时间）主批次
-#  33 19 * * *  -> 次日 03:33（北京时间）备份批次（当天已成功则自动跳过）
+#  33 19 * * *  -> 次日 03:33（北京时间）备份批次（当日已成功则跳过）
+#
+# 出口 IP 说明：agentrouter.org 前置阿里云 WAF，会按 IP 信誉给 GitHub 默认出口
+# （Azure 段）投送「滑动验证」挑战页。因此这里先拉起 Cloudflare WARP，
+# 用它的 socks5 代理（127.0.0.1:40000）出网，实测可直接穿过 WAF 完成登录=签到。
 on:
   schedule:
     - cron: '3 19 * * *'
@@ -19,8 +23,10 @@ concurrency:
 jobs:
   checkin:
     name: checkin (${{ github.event.schedule || 'manual' }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 可选：把仓库变量 RUNNER_LABEL 设成自托管 runner 标签（如 [self-hosted, windows]），
+    # 就能在家宽 IP 上跑，不需要 WARP。
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,17 +38,41 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip -q && pip install -q -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -q -r requirements.txt
+
+      - name: Bring up Cloudflare WARP (socks5 egress)
+        if: ${{ !contains(vars.RUNNER_LABEL, 'self-hosted') }}
+        continue-on-error: true
+        run: |
+          set -e
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+          for i in $(seq 1 20); do
+            if warp-cli --accept-tos status | grep -qi connected; then echo "WARP connected"; break; fi
+            sleep 3
+          done
+          warp-cli --accept-tos status
+          echo "egress ip via warp: $(curl -s --max-time 20 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org || echo unknown)"
 
       - name: Run check-in
         env:
           AGENTROUTER_USERNAME: ${{ secrets.AGENTROUTER_USERNAME }}
           AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
           AGENTROUTER_BASE: ${{ vars.AGENTROUTER_BASE || 'https://agentrouter.org' }}
+          CHECKIN_PROXY: ${{ contains(vars.RUNNER_LABEL, 'self-hosted') && '' || 'socks5h://127.0.0.1:40000' }}
           BACKUP_RUN: ${{ github.event.schedule == '33 19 * * *' && '1' || '' }}
-          DEBUG_DUMP: ${{ vars.DEBUG_DUMP }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DEBUG_DUMP: ${{ vars.DEBUG_DUMP }}
         run: python checkin.py
 
       - name: Persist history
