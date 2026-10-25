@@ -39,8 +39,8 @@ def main():
     show("C GET /api/status (curl UA)", requests.get(
         f"{BASE}/api/status", headers={"User-Agent": "curl/8.5.0"}, timeout=30))
     show("D GET /api/status (python-requests UA)", requests.get(f"{BASE}/api/status", timeout=30))
-    show("E GET /api/status (empty UA)", requests.get(
-        f"{BASE}/api/status", headers={"User-Agent": " "}, timeout=30))
+    show("E GET /api/status (odd UA)", requests.get(
+        f"{BASE}/api/status", headers={"User-Agent": "probe/1.0"}, timeout=30))
 
     hdrs = {
         "User-Agent": UA, "Content-Type": "application/json",
