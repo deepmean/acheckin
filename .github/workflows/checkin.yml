@@ -71,12 +71,16 @@ jobs:
           warp-cli --accept-tos registration new
           warp-cli --accept-tos mode proxy
           warp-cli --accept-tos connect
-          for i in $(seq 1 20); do
-            if warp-cli --accept-tos status | grep -qi connected; then echo "WARP connected"; break; fi
+          # warp-cli 报 Connected 时 socks 端口未必已监听，必须实测打通再放行
+          ready=0
+          for i in $(seq 1 40); do
+            if ip=$(curl -s --max-time 6 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org 2>/dev/null) && [ -n "$ip" ]; then
+              echo "WARP socks ready, egress ip: $ip"; ready=1; break
+            fi
             sleep 3
           done
           warp-cli --accept-tos status
-          echo "egress ip via warp: $(curl -s --max-time 20 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org || echo unknown)"
+          if [ "$ready" != "1" ]; then echo "::warning::WARP socks5 未就绪，将回落到直连"; fi
 
       - name: Run check-in
         if: steps.gate.outputs.skip != '1'
