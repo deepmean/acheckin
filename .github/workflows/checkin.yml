@@ -40,6 +40,7 @@ jobs:
           AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
           AGENTROUTER_BASE: ${{ vars.AGENTROUTER_BASE || 'https://agentrouter.org' }}
           BACKUP_RUN: ${{ github.event.schedule == '33 19 * * *' && '1' || '' }}
+          DEBUG_DUMP: ${{ vars.DEBUG_DUMP }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin.py
