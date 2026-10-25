@@ -88,6 +88,11 @@ def login(s: requests.Session, attempts: int = 3) -> dict:
                 except ValueError:
                     last_err = f"HTTP {r.status_code} 非 JSON 响应: {r.text[:200]}"
                     log(f"第 {i}/{attempts} 次尝试失败: {last_err}")
+                    if os.getenv("DEBUG_DUMP"):
+                        log(f"---- raw body ({len(r.text)} bytes) ----")
+                        log(r.text[:6000])
+                        log(f"---- headers: {dict(r.headers)} ----")
+                        log("---- end ----")
                 else:
                     if not body.get("success"):
                         # 账号密码错误之类的确定性失败，不必重试
