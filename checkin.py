@@ -21,7 +21,7 @@ AgentRouter 每日自动签到（登录即签到）
   => WAF 拦截发生在认证之前，换 GitHub OAuth、换 token 登录同样过不去。
 
   解法：让出口 IP 走 Cloudflare WARP。
-    实测 WARP 出口（如 104.28.227.105）不再触发挑战，
+    实测 WARP 出口（如 104.28.201.80）不再触发挑战，
     可直接 POST /api/user/login 拿到 success=true、checked_in=true。
 
 三、本脚本通道
@@ -34,7 +34,8 @@ AgentRouter 每日自动签到（登录即签到）
   AGENTROUTER_PASSWORD   必填
   AGENTROUTER_BASE       可选，默认 https://agentrouter.org
   CHECKIN_PROXY          可选，如 socks5h://127.0.0.1:40000
-  BACKUP_RUN             可选 '1'：当天已成功则跳过
+  SLOT                   可选，A / B / manual（由 gate.py 决定，仅用于记录）
+  SLOT_TARGET            可选，命中槽位的目标时间；未到点则先等到达
   TG_BOT_TOKEN/TG_CHAT_ID 可选，Telegram 推送
   DEBUG_DUMP             可选，打印异常响应
 """
@@ -52,7 +53,8 @@ import requests
 BASE = (os.getenv("AGENTROUTER_BASE") or "https://agentrouter.org").rstrip("/")
 USERNAME = (os.getenv("AGENTROUTER_USERNAME") or "").strip()
 PASSWORD = os.getenv("AGENTROUTER_PASSWORD") or ""
-BACKUP_RUN = (os.getenv("BACKUP_RUN") or "").strip().lower() not in ("", "0", "false", "no")
+SLOT = (os.getenv("SLOT") or "manual").strip() or "manual"
+SLOT_TARGET = (os.getenv("SLOT_TARGET") or "").strip()
 TG_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
 TG_CHAT = (os.getenv("TG_CHAT_ID") or "").strip()
 DEBUG = bool(os.getenv("DEBUG_DUMP"))
@@ -177,25 +179,6 @@ def quota_str(q) -> str:
 
 
 # ------------------------------ 记录 / 通知 ------------------------------ #
-def read_history() -> list[dict]:
-    if not HISTORY.exists():
-        return []
-    rows = []
-    for line in HISTORY.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except ValueError:
-            continue
-    return rows
-
-
-def already_ok_today(today: str) -> bool:
-    return any(r.get("date_cst") == today and r.get("success") for r in read_history())
-
-
 def append_history(rec: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with HISTORY.open("a", encoding="utf-8") as fh:
@@ -224,19 +207,31 @@ def tg_notify(text: str) -> None:
         log(f"Telegram 推送失败: {type(exc).__name__}: {exc}")
 
 
+def wait_for_target() -> None:
+    """闸门放行时可能比目标分钟早十几分钟，等到达目标再签到。"""
+    if not SLOT_TARGET:
+        return
+    try:
+        target = dt.datetime.fromisoformat(SLOT_TARGET)
+    except ValueError:
+        return
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=CST)
+    delta = (target - now_cst()).total_seconds()
+    if 0 < delta <= 900:
+        log(f"等待到目标时间 {target:%H:%M:%S}（{delta:.0f}s）")
+        time.sleep(delta)
+
+
 # ---------------------------------- main ---------------------------------- #
 def main() -> int:
     if not USERNAME or not PASSWORD:
         log("缺少 AGENTROUTER_USERNAME / AGENTROUTER_PASSWORD")
         return 2
 
+    wait_for_target()
     today = now_cst().strftime("%Y-%m-%d")
-    if BACKUP_RUN and already_ok_today(today):
-        log(f"{today} 已签到成功，备份批次跳过")
-        write_step_summary([f"### AgentRouter 签到 `{today}`", "", "备份批次：今日已成功，跳过。"])
-        return 0
-
-    log(f"开始签到 {BASE} | 账号 {USERNAME} | 日期 {today}")
+    log(f"开始签到 {BASE} | 账号 {USERNAME} | 日期 {today} | 槽位 {SLOT}")
 
     result, errors = None, []
     for label, proxies in proxy_candidates():
@@ -254,10 +249,10 @@ def main() -> int:
     if result is None:
         err = " | ".join(errors) or "未知错误"
         append_history({"date_cst": today, "ts": now_cst().isoformat(timespec="seconds"),
-                        "success": False, "checked_in": None, "error": err[:400]})
-        write_step_summary([f"### AgentRouter 签到 `{today}` 失败", "",
+                        "slot": SLOT, "success": False, "checked_in": None, "error": err[:400]})
+        write_step_summary([f"### AgentRouter 签到 `{today}`（槽位 {SLOT}）失败", "",
                             f"```\n{err[:1200]}\n```"])
-        tg_notify(f"❌ AgentRouter 签到失败 {today}\n{err[:300]}")
+        tg_notify(f"❌ AgentRouter 签到失败 {today} 槽位{SLOT}\n{err[:300]}")
         return 1
 
     data = result["data"]
@@ -276,20 +271,20 @@ def main() -> int:
 
     rec = {
         "date_cst": today, "ts": now_cst().isoformat(timespec="seconds"),
-        "success": True, "checked_in": checked_in, "verdict": verdict,
+        "slot": SLOT, "success": True, "checked_in": checked_in, "verdict": verdict,
         "via": result["via"], "user_id": uid, "username": username,
         "group": group, "quota": quota, "used_quota": used,
     }
     append_history(rec)
     write_step_summary([
-        f"### AgentRouter 签到 `{today}`", "",
+        f"### AgentRouter 签到 `{today}`（槽位 {SLOT}）", "",
         f"- 结论：**{verdict}**（`checked_in={checked_in}`，通道 `{result['via']}`）",
         f"- 账号：`{username}`（id `{uid}`，分组 `{group}`）",
         f"- 额度：{quota_str(quota)}",
         f"- 已用：{quota_str(used)}",
         f"- 时间：{rec['ts']}",
     ])
-    tg_notify(f"✅ AgentRouter {today} {verdict}\n账号 {username}\n额度 {quota_str(quota)}")
+    tg_notify(f"✅ AgentRouter {today} 槽位{SLOT} {verdict}\n账号 {username}\n额度 {quota_str(quota)}")
     return 0
 
 

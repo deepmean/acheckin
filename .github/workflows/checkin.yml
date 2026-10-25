@@ -1,16 +1,21 @@
 name: AgentRouter Daily Check-in
 
-# 时间说明：GitHub Actions cron 用 UTC，北京时间 = UTC+8
-#   3 19 * * *  -> 次日 03:03（北京时间）主批次
-#  33 19 * * *  -> 次日 03:33（北京时间）备份批次（当日已成功则跳过）
+# ── 时间机制（每天两个随机时间，严格间隔 12 小时，分钟避开整点）────────────
+# gate.py 以北京日期为随机种子，当天固定生成两个时间点：
+#     hA:m  与  (hA+12):m      m ∈ 7..11（永不整点）
+# 例如今天抽到 04:09 / 16:09，明天抽到 11:07 / 23:07。
 #
-# 出口 IP 说明：agentrouter.org 前置阿里云 WAF，会按 IP 信誉给 GitHub 默认出口
-# （Azure 段）投送「滑动验证」挑战页。因此这里先拉起 Cloudflare WARP，
-# 用它的 socks5 代理（127.0.0.1:40000）出网，实测可直接穿过 WAF 完成登录=签到。
+# 执行方式：cron 每小时 :07 触发一次轻量闸门 job（只跑标准库，几秒钟），
+# 命中「目标前 90 秒 ~ 目标后 2 小时」窗口才放行真正的签到 job；
+# 未命中时只留一条几秒钟的日志，不产生任何提交。
+# 目标后 2 小时的宽限窗口同时充当自动补签：GitHub 定时延迟或首次失败都会重试。
+#
+# 出口 IP：agentrouter.org 前置阿里云 WAF，按 IP 信誉拦截 GitHub 默认出口
+# （Azure 段会收到「滑动验证」挑战页）。因此签到前先拉起 Cloudflare WARP，
+# 用它的 socks5 代理（127.0.0.1:40000）出网，实测可穿过 WAF 完成登录=签到。
 on:
   schedule:
-    - cron: '3 19 * * *'
-    - cron: '33 19 * * *'
+    - cron: '7 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -21,10 +26,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: gate
+    # 可选：仓库变量 RUNNER_LABEL 设为自托管 runner 标签（如 [self-hosted, windows]）
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      hit: ${{ steps.g.outputs.hit }}
+      target: ${{ steps.g.outputs.target }}
+      plan: ${{ steps.g.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: g
+        name: Resolve today's random slots
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: python gate.py
+
   checkin:
-    name: checkin (${{ github.event.schedule || 'manual' }})
-    # 可选：把仓库变量 RUNNER_LABEL 设成自托管 runner 标签（如 [self-hosted, windows]），
-    # 就能在家宽 IP 上跑，不需要 WARP。
+    name: checkin (${{ needs.gate.outputs.hit }})
+    needs: gate
+    if: ${{ needs.gate.outputs.hit != 'none' }}
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
@@ -69,7 +91,8 @@ jobs:
           AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
           AGENTROUTER_BASE: ${{ vars.AGENTROUTER_BASE || 'https://agentrouter.org' }}
           CHECKIN_PROXY: ${{ contains(vars.RUNNER_LABEL, 'self-hosted') && '' || 'socks5h://127.0.0.1:40000' }}
-          BACKUP_RUN: ${{ github.event.schedule == '33 19 * * *' && '1' || '' }}
+          SLOT: ${{ needs.gate.outputs.hit }}
+          SLOT_TARGET: ${{ needs.gate.outputs.target }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DEBUG_DUMP: ${{ vars.DEBUG_DUMP }}
@@ -86,6 +109,6 @@ jobs:
             echo "history 无变化，跳过提交"
             exit 0
           fi
-          git commit -m "chore(checkin): $(TZ=Asia/Shanghai date +%F) record"
+          git commit -m "chore(checkin): $(TZ=Asia/Shanghai date +%F) slot ${{ needs.gate.outputs.hit }}"
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
           git push
