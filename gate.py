@@ -5,23 +5,29 @@
 
 需求：每天随机两个签到时间，两者严格相隔 12 小时，分钟避开整点。
 
-为什么不是「每小时 cron + 闸门」：
-  实测本账号下高频 cron 会被 GitHub 丢掉（*/11 探测 25 分钟一次没跑，
-  每小时 :07 连续三次全空），而同账号另一个仓库的**日级 cron** 每天都正常出跑。
-  所以这里改成「两次日级 cron + 作业内精确等待」：
-    cron 05:16 UTC = 北京 00:05 启动 A 班
-    cron 05:04 UTC = 北京 12:05 启动 B 班
-  两班各自等到当天抽中的那一分钟再签到 —— 调度晚几分钟甚至一小时都不影响结果。
+实测到的两件事实（2026-10-25/26）：
+  1. 高频 cron 会被丢：'7 * * * *' 连续 3 个整点没触发，'*/11' 探针 25 分钟一次没跑。
+  2. 日级 cron 会触发，但**迟到**：A 班 cron 定在 16:05 UTC，实际 18:56 UTC 才跑（+2h51m）。
+     同账号另一仓库的日级 cron 也每天稳定出跑，所以日级是可靠档位，只是时刻会偏移。
+
+因此设计成：
+  · 两次日级 cron 只当「开工信号」：北京 00:05（A 班）/ 12:05（B 班）。
+  · A 班：目标是当天抽中的时刻；若调度迟到（目标已过）就立即执行，
+    并把「实际执行时刻」写进 history.jsonl 的 ts。
+  · B 班：读 A 班的实际 ts，目标 = A 实际时刻 + 12 小时，
+    这样即使 A 班迟到了 3 小时，两班间隔依旧严格 12 小时。
+    A 班若当天没成功（或还没跑），B 班回退到抽中的时刻。
+  · 等待上限 MAX_WAIT 分钟，保证作业不超过 GitHub 单作业 6 小时上限。
 
 随机规则（以北京日期为种子，当天固定）：
   off ∈ 0..300 分钟随机
-  m   = (5 + off) % 60，落在 3..57 之间（避开整点 0/1/2 分与 58/59 分）
-  槽位 A = 00:m + off 分钟     槽位 B = 12:m + off 分钟   ← 严格相隔 12 小时
+  m   = (5 + off) % 60，落在 3..57（避开整点 0/1/2 分与 58/59 分）
+  抽中槽位 A = 00:05 + off      槽位 B = 12:05 + off
 
 环境变量
   EVENT_NAME   github.event_name（schedule / workflow_dispatch）
-  SLOT         A | B（schedule 时由 workflow 传入；dispatch 走 manual）
-  SLOT_MODE    wait（默认，等到目标分钟）/ now（立即执行）
+  SLOT         A | B（schedule 时由 workflow 传入）
+  SLOT_MODE    wait（默认）/ now（立即执行）
 
 $GITHUB_OUTPUT
   slot / target / skip
@@ -36,16 +42,17 @@ import time
 from pathlib import Path
 
 CST = dt.timezone(dt.timedelta(hours=8))
-BASE_MINUTE = 5      # 与 cron 的分钟对齐：00:05 / 12:05
-OFF_MAX = 300        # 随机偏移上限（分钟）= 5 小时，作业最长占用远小于 6h 上限
-BAD_MINUTES = {0, 1, 2, 58, 59}   # 避开整点及其前后
+BASE_MINUTE = 5       # 与 cron 的分钟对齐：00:05 / 12:05
+OFF_MAX = 300         # 随机偏移上限（分钟）
+MAX_WAIT = 330        # 单次等待上限（分钟），远小于 GitHub 单作业 6 小时限制
+BAD_MINUTES = {0, 1, 2, 58, 59}
 
 ROOT = Path(__file__).resolve().parent
 HISTORY = ROOT / "state" / "history.jsonl"
 
 
 def offset_minutes(now: dt.datetime) -> int:
-    """当天固定的随机偏移（同日多次调用一致）。"""
+    """当天固定的随机偏移（同日多次调用结果一致）。"""
     rnd = random.Random(f"agentrouter:{now:%Y-%m-%d}")
     for _ in range(200):
         off = rnd.randint(0, OFF_MAX)
@@ -57,8 +64,8 @@ def offset_minutes(now: dt.datetime) -> int:
 def plan(now: dt.datetime) -> dict[str, tuple[int, int]]:
     off = offset_minutes(now)
     minute = (BASE_MINUTE + off) % 60
-    hour_a = (0 + (BASE_MINUTE + off) // 60) % 24           # 00:05 + off
-    hour_b = (12 + (BASE_MINUTE + off) // 60) % 24          # 12:05 + off
+    hour_a = (0 + (BASE_MINUTE + off) // 60) % 24
+    hour_b = (12 + (BASE_MINUTE + off) // 60) % 24
     return {"A": (hour_a, minute), "B": (hour_b, minute)}
 
 
@@ -68,21 +75,39 @@ def plan_text(now: dt.datetime) -> str:
             f"B={p['B'][0]:02d}:{p['B'][1]:02d} (北京时间, 间隔 12 小时)")
 
 
-def done_slots(today: str) -> set[str]:
+def history_rows() -> list[dict]:
     if not HISTORY.exists():
-        return set()
-    done: set[str] = set()
+        return []
+    rows = []
     for line in HISTORY.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            rec = json.loads(line)
+            rows.append(json.loads(line))
         except ValueError:
             continue
-        if rec.get("date_cst") == today and rec.get("success") and rec.get("slot"):
-            done.add(str(rec["slot"]))
-    return done
+    return rows
+
+
+def done_slots(rows: list[dict], today: str) -> set[str]:
+    return {str(r["slot"]) for r in rows
+            if r.get("date_cst") == today and r.get("success") and r.get("slot")}
+
+
+def slot_actual_ts(rows: list[dict], today: str, slot: str) -> dt.datetime | None:
+    """某槽位当天成功签到的实际时刻（取最后一条）。"""
+    found = None
+    for r in rows:
+        if r.get("date_cst") != today or r.get("slot") != slot or not r.get("success"):
+            continue
+        if not r.get("ts"):
+            continue
+        try:
+            found = dt.datetime.fromisoformat(r["ts"])
+        except ValueError:
+            continue
+    return found
 
 
 def sleep_until(target: dt.datetime) -> None:
@@ -116,31 +141,52 @@ def main() -> int:
         print("[gate] 手动触发 -> 立即执行，不等待")
     else:
         slot = "B" if slot_env == "B" else "A"
+        rows = history_rows()
+        done = done_slots(rows, today)
         p = plan(now)
         target = now.replace(hour=p[slot][0], minute=p[slot][1], second=0, microsecond=0)
-        done = done_slots(today)
 
         if slot in done:
+            done_ts = slot_actual_ts(rows, today, slot)
+            outputs["slot"] = slot
             outputs["skip"] = "1"
-            print(f"[gate] 槽位 {slot} 今日已完成，跳过")
-        elif mode == "now":
-            print(f"[gate] 槽位 {slot} 立即模式，目标 {target:%H:%M}")
-        elif target <= now:
-            print(f"[gate] 槽位 {slot} 目标 {target:%H:%M} 已过（调度延迟），立即执行")
+            outputs["target"] = (done_ts or target).isoformat(timespec="seconds")
+            print(f"[gate] 槽位 {slot} 今日已完成（{done_ts:%H:%M:%S}），跳过")
         else:
-            print(f"[gate] 槽位 {slot} 目标 {target:%H:%M}，开始等待")
-            sleep_until(target)
-            print(f"[gate] 到达目标时间 {dt.datetime.now(CST):%H:%M:%S}")
+            if slot == "B":
+                a_ts = slot_actual_ts(rows, today, "A")
+                if a_ts:
+                    chained = a_ts + dt.timedelta(hours=12)
+                    print(f"[gate] A 班实际执行 {a_ts:%H:%M:%S} -> B 目标锁死为 {chained:%H:%M:%S}（严格 12 小时）")
+                    target = chained
+                else:
+                    print("[gate] A 班今天没有成功记录，B 使用抽中时刻")
 
-        outputs["slot"] = slot
-        outputs["target"] = target.isoformat(timespec="seconds")
+            ceiling = now + dt.timedelta(minutes=MAX_WAIT)
+            if target > ceiling:
+                print(f"[gate] 目标 {target:%H:%M:%S} 超出等待上限，改为 {ceiling:%H:%M:%S}")
+                target = ceiling
+
+            if mode == "now":
+                print(f"[gate] 槽位 {slot} 立即模式")
+            elif target <= now:
+                delay_min = (now - target).total_seconds() / 60
+                print(f"[gate] 槽位 {slot} 目标 {target:%H:%M:%S} 已过 {delay_min:.0f} 分钟"
+                      f"（调度延迟），立即执行")
+            else:
+                print(f"[gate] 槽位 {slot} 目标 {target:%H:%M:%S}，开始等待")
+                sleep_until(target)
+                print(f"[gate] 到达目标时间 {dt.datetime.now(CST):%H:%M:%S}")
+
+            outputs["slot"] = slot
+            outputs["target"] = target.isoformat(timespec="seconds")
 
     path = os.getenv("GITHUB_OUTPUT")
     if path:
         with open(path, "a", encoding="utf-8") as fh:
             for k, v in outputs.items():
                 fh.write(f"{k}={v}\n")
-    print(f"[gate] 结果 slot={outputs['slot']} skip={outputs['skip']}")
+    print(f"[gate] 结果 slot={outputs['slot']} target={outputs['target']} skip={outputs['skip']}")
     return 0
 
 
