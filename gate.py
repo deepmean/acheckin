@@ -135,14 +135,20 @@ def main() -> int:
     print(f"[gate] 现在 {now:%Y-%m-%d %H:%M:%S} CST")
     print(f"[gate] 今日计划 {plan_text(now)}")
 
-    if event == "workflow_dispatch" or slot_env == "MANUAL":
+    if slot_env == "MANUAL" or (event == "workflow_dispatch" and slot_env not in ("A", "B", "AUTO")):
         outputs["slot"] = "manual"
         outputs["target"] = now.isoformat(timespec="seconds")
-        print("[gate] 手动触发 -> 立即执行，不等待")
+        print("[gate] 手动立即模式 -> 不等待")
     else:
-        slot = "B" if slot_env == "B" else "A"
         rows = history_rows()
         done = done_slots(rows, today)
+
+        if slot_env in ("A", "B"):
+            slot = slot_env
+        else:  # AUTO：选当天还没成功的槽位（先 A 后 B）
+            slot = "A" if "A" not in done else ("B" if "B" not in done else "A")
+            print(f"[gate] AUTO 选槽 -> {slot}（已完成 {sorted(done) or '无'}）")
+
         p = plan(now)
         target = now.replace(hour=p[slot][0], minute=p[slot][1], second=0, microsecond=0)
 

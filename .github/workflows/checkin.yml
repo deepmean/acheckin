@@ -18,6 +18,11 @@ on:
     - cron: '5 16 * * *'   # 北京 00:05 启动 A 班
     - cron: '5 4 * * *'    # 北京 12:05 启动 B 班
   workflow_dispatch:
+    inputs:
+      slot:
+        description: 'auto=按当天计划选未完成的槽位并等待 / A / B / manual=立即签到'
+        required: false
+        default: auto
 
 permissions:
   contents: write
@@ -47,7 +52,7 @@ jobs:
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
-          SLOT: ${{ github.event.schedule == '5 4 * * *' && 'B' || 'A' }}
+          SLOT: ${{ github.event.inputs.slot || (github.event.schedule == '5 4 * * *' && 'B' || 'A') }}
           SLOT_MODE: wait
         run: python gate.py
 
