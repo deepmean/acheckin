@@ -87,8 +87,53 @@ B 班：目标 = A 班实际 ts + 12 小时   ← 即使 A 迟到 3 小时，间
 [gate] 今日计划 A=00:19 B=12:19
 [gate] 槽位 A 目标 00:19:00 已过 158 分钟（调度延迟），立即执行
 [gate] 登录成功 ... checked_in=True   ← 02:57:48 执行，额度 +12,500,000（约 +$25）
-B 班预期：目标锁死为 14:57:48（严格 12 小时）
+[gate] AUTO 选槽 -> B（已完成 ['A']）
+[gate] A 班实际执行 02:57:48 -> B 目标锁死为 14:57:48（严格 12 小时）
 ```
+
+## 三之二、GitHub 自带 cron 的真实可靠性（重要）
+
+| 观察 | 结果 |
+| --- | --- |
+| 每小时 cron `'7 * * * *'` | ❌ 3 个整点全空 |
+| `'*/11 * * * *'` 探针 | ❌ 25 分钟一次没跑 |
+| 日级 cron A 班 | ⚠️ 触发但迟到 2h51m |
+| 日级 cron B 班（同日） | ❌ 完全没触发（迟到 3.5h 后仍未出现，队列也为空） |
+
+**结论：GitHub 自带 cron 只能保证「每天大概醒一次」，第二次常常整个丢失，
+所以「严格 12 小时」不能靠它兜。**
+
+## 三之三、要严格 12 小时：接一个外部定时器（推荐）
+
+`workflow_dispatch` 支持 `slot=auto`：闸门会挑当天还没成功的槽位、算出目标时刻、
+必要时在作业内等待（≤330 分钟）再签到。所以只要**外部每 12 小时调一次 dispatch**，
+两次签到就严格相隔 12 小时，且分钟仍由当天种子决定（非整点）。
+
+外部定时器（cron-job.org / 阿里云函数 / 任意 uptime 机器人）配置两个任务：
+
+```
+POST https://api.github.com/repos/deepmean/acheckin/actions/workflows/checkin.yml/dispatches
+Headers:
+  Authorization: Bearer <PAT>
+  Accept: application/vnd.github+json
+Body:
+  {"ref": "main", "inputs": {"slot": "auto"}}
+```
+
+- 任务 1：每天 00:05（北京时间）
+- 任务 2：每天 12:05（北京时间）
+
+PAT 用 fine-grained token，最少权限：`Actions: Read and write` + `Contents: Read`（只读即可，
+写历史用的是 workflow 内的 GITHUB_TOKEN）。
+
+命令行等价：
+
+```bash
+gh workflow run checkin.yml -R deepmean/acheckin --ref main -f slot=auto
+```
+
+没接外部定时器时，两班 GitHub cron 仍会作为兜底；闸门按 `history.jsonl`
+去重，同一槽位当天成功过就不会重复签。
 
 ## 四、出口 IP 方案
 
