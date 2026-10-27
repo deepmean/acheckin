@@ -5,29 +5,31 @@
 
 需求：每天随机两个签到时间，两者严格相隔 12 小时，分钟避开整点。
 
-实测到的两件事实（2026-10-25/26）：
+实测到的三件事实（2026-10-25 ~ 10-27）：
   1. 高频 cron 会被丢：'7 * * * *' 连续 3 个整点没触发，'*/11' 探针 25 分钟一次没跑。
-  2. 日级 cron 会触发，但**迟到**：A 班 cron 定在 16:05 UTC，实际 18:56 UTC 才跑（+2h51m）。
-     同账号另一仓库的日级 cron 也每天稳定出跑，所以日级是可靠档位，只是时刻会偏移。
+  2. 日级 cron 会触发但**迟到**：+2h51m / +4h54m。
+  3. 日级第二条 cron（B 班）连续两天**整天没触发**（次日才补跑）。
+  => 不能指望「某一条 cron 一定在某个时刻醒」，只能靠「多条机会 + 去重」。
 
-因此设计成：
-  · 两次日级 cron 只当「开工信号」：北京 00:05（A 班）/ 12:05（B 班）。
-  · A 班：目标是当天抽中的时刻；若调度迟到（目标已过）就立即执行，
-    并把「实际执行时刻」写进 history.jsonl 的 ts。
-  · B 班：读 A 班的实际 ts，目标 = A 实际时刻 + 12 小时，
-    这样即使 A 班迟到了 3 小时，两班间隔依旧严格 12 小时。
-    A 班若当天没成功（或还没跑），B 班回退到抽中的时刻。
-  · 等待上限 MAX_WAIT 分钟，保证作业不超过 GitHub 单作业 6 小时上限。
-
-随机规则（以北京日期为种子，当天固定）：
-  off ∈ 0..300 分钟随机
-  m   = (5 + off) % 60，落在 3..57（避开整点 0/1/2 分与 58/59 分）
-  抽中槽位 A = 00:05 + off      槽位 B = 12:05 + off
+设计：
+  · workflow 每 2 小时唤醒一次（UTC 偶数点 :05），全天 12 条，不区分 A/B。
+  · 闸门按当天计划挑槽位：
+        槽位 A = 00:05 + off       （off ∈ 0..300 分钟随机）
+        槽位 B = A 班实际执行时刻 + 12 小时（A 没成功则退回 12:05 + off）
+    判据：
+        目标已过、槽位未完成      -> 立即补签
+        目标在未来 WAIT_AHEAD 内  -> 等到目标时刻再签
+        目标还很远                -> 本次跳过，把机会让给后面的 cron
+        两个槽位都完成            -> 跳过
+  · 等待上限 WAIT_AHEAD=150 分钟，配合 2 小时一条 cron，保证「总有一条落在窗口内」，
+    同时每条 job 最多占用 2.5 小时，远低于 GitHub 单作业 6 小时上限，也不会堆积队列。
+  · 分钟 m = (5 + off) % 60 落在 3..57，永远避开整点。
+  · 同槽位当天成功后写入 history.jsonl，后续 cron 读到即跳过 —— 去重靠它，不靠 cron 次数。
 
 环境变量
-  EVENT_NAME   github.event_name（schedule / workflow_dispatch）
-  SLOT         A | B（schedule 时由 workflow 传入）
-  SLOT_MODE    wait（默认）/ now（立即执行）
+  EVENT_NAME   github.event_name
+  SLOT         auto（默认）/ A / B / manual
+  SLOT_MODE    wait（默认）/ now（立即）
 
 $GITHUB_OUTPUT
   slot / target / skip
@@ -42,9 +44,9 @@ import time
 from pathlib import Path
 
 CST = dt.timezone(dt.timedelta(hours=8))
-BASE_MINUTE = 5       # 与 cron 的分钟对齐：00:05 / 12:05
+BASE_MINUTE = 5       # 与 cron 的分钟对齐
 OFF_MAX = 300         # 随机偏移上限（分钟）
-MAX_WAIT = 330        # 单次等待上限（分钟），远小于 GitHub 单作业 6 小时限制
+WAIT_AHEAD = 150      # 目标在未来这么多分钟内才等，否则让给后面的 cron
 BAD_MINUTES = {0, 1, 2, 58, 59}
 
 ROOT = Path(__file__).resolve().parent
@@ -96,7 +98,6 @@ def done_slots(rows: list[dict], today: str) -> set[str]:
 
 
 def slot_actual_ts(rows: list[dict], today: str, slot: str) -> dt.datetime | None:
-    """某槽位当天成功签到的实际时刻（取最后一条）。"""
     found = None
     for r in rows:
         if r.get("date_cst") != today or r.get("slot") != slot or not r.get("success"):
@@ -108,6 +109,17 @@ def slot_actual_ts(rows: list[dict], today: str, slot: str) -> dt.datetime | Non
         except ValueError:
             continue
     return found
+
+
+def slot_target(rows: list[dict], now: dt.datetime, slot: str) -> dt.datetime:
+    """槽位目标时刻。B 跟随 A 的实际执行时刻 + 12 小时。"""
+    p = plan(now)
+    target = now.replace(hour=p[slot][0], minute=p[slot][1], second=0, microsecond=0)
+    if slot == "B":
+        a_ts = slot_actual_ts(rows, now.strftime("%Y-%m-%d"), "A")
+        if a_ts:
+            target = a_ts + dt.timedelta(hours=12)
+    return target
 
 
 def sleep_until(target: dt.datetime) -> None:
@@ -128,62 +140,54 @@ def main() -> int:
     now = dt.datetime.now(CST)
     today = f"{now:%Y-%m-%d}"
     mode = (os.getenv("SLOT_MODE") or "wait").strip().lower()
-    event = (os.getenv("EVENT_NAME") or "").strip()
-    slot_env = (os.getenv("SLOT") or "").strip().upper()
+    slot_env = (os.getenv("SLOT") or "auto").strip().upper()
 
     outputs = {"slot": "manual", "target": "", "skip": "0"}
     print(f"[gate] 现在 {now:%Y-%m-%d %H:%M:%S} CST")
     print(f"[gate] 今日计划 {plan_text(now)}")
 
-    if slot_env == "MANUAL" or (event == "workflow_dispatch" and slot_env not in ("A", "B", "AUTO")):
+    if slot_env == "MANUAL":
         outputs["slot"] = "manual"
         outputs["target"] = now.isoformat(timespec="seconds")
         print("[gate] 手动立即模式 -> 不等待")
     else:
         rows = history_rows()
         done = done_slots(rows, today)
+        print(f"[gate] 今日已完成槽位: {sorted(done) or '无'}")
 
-        if slot_env in ("A", "B"):
-            slot = slot_env
-        else:  # AUTO：选当天还没成功的槽位（先 A 后 B）
-            slot = "A" if "A" not in done else ("B" if "B" not in done else "A")
-            print(f"[gate] AUTO 选槽 -> {slot}（已完成 {sorted(done) or '无'}）")
-
-        p = plan(now)
-        target = now.replace(hour=p[slot][0], minute=p[slot][1], second=0, microsecond=0)
-
-        if slot in done:
-            done_ts = slot_actual_ts(rows, today, slot)
-            outputs["slot"] = slot
-            outputs["skip"] = "1"
-            outputs["target"] = (done_ts or target).isoformat(timespec="seconds")
-            print(f"[gate] 槽位 {slot} 今日已完成（{done_ts:%H:%M:%S}），跳过")
-        else:
-            if slot == "B":
+        slot, target, decision = None, None, "skip"
+        order = [slot_env] if slot_env in ("A", "B") else ["A", "B"]
+        for s in order:
+            if s in done:
+                print(f"[gate] 槽位 {s} 已完成，跳过")
+                continue
+            t = slot_target(rows, now, s)
+            delta = (now - t).total_seconds()
+            if s == "B":
                 a_ts = slot_actual_ts(rows, today, "A")
                 if a_ts:
-                    chained = a_ts + dt.timedelta(hours=12)
-                    print(f"[gate] A 班实际执行 {a_ts:%H:%M:%S} -> B 目标锁死为 {chained:%H:%M:%S}（严格 12 小时）")
-                    target = chained
-                else:
-                    print("[gate] A 班今天没有成功记录，B 使用抽中时刻")
+                    print(f"[gate] A 班实际执行 {a_ts:%H:%M:%S} -> B 目标 {t:%H:%M:%S}（严格 12 小时）")
+            if delta >= 0:
+                slot, target, decision = s, t, "late"
+                print(f"[gate] 槽位 {s} 目标 {t:%H:%M:%S} 已过 {delta / 60:.0f} 分钟 -> 立即补签")
+                break
+            if -delta <= WAIT_AHEAD * 60:
+                slot, target, decision = s, t, "wait"
+                print(f"[gate] 槽位 {s} 目标 {t:%H:%M:%S}，{-delta / 60:.0f} 分钟后 -> 等待")
+                break
+            print(f"[gate] 槽位 {s} 目标 {t:%H:%M:%S} 还有 {-delta / 60:.0f} 分钟，"
+                  f"超出 {WAIT_AHEAD} 分钟窗口 -> 让给后面的 cron")
 
-            ceiling = now + dt.timedelta(minutes=MAX_WAIT)
-            if target > ceiling:
-                print(f"[gate] 目标 {target:%H:%M:%S} 超出等待上限，改为 {ceiling:%H:%M:%S}")
-                target = ceiling
-
+        if slot is None:
+            outputs["slot"] = "none"
+            outputs["skip"] = "1"
+            print("[gate] 本次不签到")
+        else:
             if mode == "now":
-                print(f"[gate] 槽位 {slot} 立即模式")
-            elif target <= now:
-                delay_min = (now - target).total_seconds() / 60
-                print(f"[gate] 槽位 {slot} 目标 {target:%H:%M:%S} 已过 {delay_min:.0f} 分钟"
-                      f"（调度延迟），立即执行")
-            else:
-                print(f"[gate] 槽位 {slot} 目标 {target:%H:%M:%S}，开始等待")
+                print(f"[gate] 立即模式：不等窗口直接执行槽位 {slot}")
+            elif decision == "wait":
                 sleep_until(target)
                 print(f"[gate] 到达目标时间 {dt.datetime.now(CST):%H:%M:%S}")
-
             outputs["slot"] = slot
             outputs["target"] = target.isoformat(timespec="seconds")
 

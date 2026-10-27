@@ -14,13 +14,15 @@ name: AgentRouter Daily Check-in
 # （Azure 段会收到「滑动验证」挑战页）。因此签到前先拉起 Cloudflare WARP，
 # 用它的 socks5 代理（127.0.0.1:40000）出网，实测可穿过 WAF 完成登录=签到。
 on:
+  # 每 2 小时一条（UTC 偶数点 :05 = 北京偶数点 :05），全天 12 条。
+  # 单条 cron 会被 GitHub 丢掉/延迟 2~6 小时，所以不押注某一条：
+  # 每条只是「醒来看一眼」，闸门决定这次是否该签到（含去重与目标窗口判断）。
   schedule:
-    - cron: '5 16 * * *'   # 北京 00:05 启动 A 班
-    - cron: '5 4 * * *'    # 北京 12:05 启动 B 班
+    - cron: '5 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
   workflow_dispatch:
     inputs:
       slot:
-        description: 'auto=按当天计划选未完成的槽位并等待 / A / B / manual=立即签到'
+        description: 'auto=按当天计划选未完成的槽位 / A / B / manual=立即签到'
         required: false
         default: auto
 
@@ -36,8 +38,8 @@ jobs:
     name: checkin
     # 可选：仓库变量 RUNNER_LABEL 设为自托管 runner 标签（如 [self-hosted, windows]）
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
-    # 随机偏移最多 300 分钟 + 签到本身约 3 分钟；GitHub 单作业上限 6 小时
-    timeout-minutes: 350
+    # 闸门最多等 150 分钟 + 签到本身约 3 分钟
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,7 +54,7 @@ jobs:
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
-          SLOT: ${{ github.event.inputs.slot || (github.event.schedule == '5 4 * * *' && 'B' || 'A') }}
+          SLOT: ${{ github.event.inputs.slot || 'auto' }}
           SLOT_MODE: wait
         run: python gate.py
 
