@@ -47,6 +47,8 @@ CST = dt.timezone(dt.timedelta(hours=8))
 BASE_MINUTE = 5       # 与 cron 的分钟对齐
 OFF_MAX = 300         # 随机偏移上限（分钟）
 WAIT_AHEAD = 150      # 目标在未来这么多分钟内才等，否则让给后面的 cron
+LEAD_SECONDS = 120    # 只等到目标前 2 分钟就放行，把装 WARP 的时间塞进这段空档，
+                      # 由 checkin.py 的 wait_for_target 精确等到目标秒（误差 <5s）
 BAD_MINUTES = {0, 1, 2, 58, 59}
 
 ROOT = Path(__file__).resolve().parent
@@ -186,8 +188,10 @@ def main() -> int:
             if mode == "now":
                 print(f"[gate] 立即模式：不等窗口直接执行槽位 {slot}")
             elif decision == "wait":
-                sleep_until(target)
-                print(f"[gate] 到达目标时间 {dt.datetime.now(CST):%H:%M:%S}")
+                lead = target - dt.timedelta(seconds=LEAD_SECONDS)
+                if lead > dt.datetime.now(CST):
+                    sleep_until(lead)
+                    print(f"[gate] 已到目标前 {LEAD_SECONDS}s，放行给签到步骤精确对齐目标秒")
             outputs["slot"] = slot
             outputs["target"] = target.isoformat(timespec="seconds")
 
