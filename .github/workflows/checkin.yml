@@ -17,11 +17,12 @@ name: AgentRouter Daily Check-in
 # （Azure 段会收到「滑动验证」挑战页）。因此签到前先拉起 Cloudflare WARP，
 # 用它的 socks5 代理（127.0.0.1:40000）出网，实测可穿过 WAF 完成登录=签到。
 on:
-  # 每 2 小时一条（UTC 偶数点 :05 = 北京偶数点 :05），全天 12 条。
+  # 每小时一条（UTC :05 = 北京 :05），全天 24 条。
   # 单条 cron 会被 GitHub 丢掉/延迟 2~6 小时，所以不押注某一条：
   # 每条只是「醒来看一眼」，闸门决定这次是否该签到（含去重与目标窗口判断）。
+  # 等待窗口只有 40 分钟 —— 实测 112 分钟的长等待会被 runner 判 lost communication 杀掉。
   schedule:
-    - cron: '5 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
+    - cron: '5 * * * *'
   workflow_dispatch:
     inputs:
       slot:
@@ -41,8 +42,8 @@ jobs:
     name: checkin
     # 可选：仓库变量 RUNNER_LABEL 设为自托管 runner 标签（如 [self-hosted, windows]）
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
-    # 闸门最多等 150 分钟 + 签到本身约 3 分钟
-    timeout-minutes: 180
+    # 闸门最多等 40 分钟 + 签到本身约 3 分钟；长等待会被 runner 回收
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
