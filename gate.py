@@ -49,7 +49,7 @@ from pathlib import Path
 CST = dt.timezone(dt.timedelta(hours=8))
 BASE_MINUTE = 5       # 与 cron 的分钟对齐
 OFF_MAX = 300         # 随机偏移上限（分钟）
-WAIT_AHEAD = 40       # 目标在未来这么多分钟内才等；长等待会被 runner 回收（10-29 实测）
+WAIT_AHEAD = 55       # 目标在未来这么多分钟内才等；>60 分钟的长等待会被 runner 回收（10-29 实测 112 分钟被杀）
 LEAD_SECONDS = 120    # 只等到目标前 2 分钟就放行，把装 WARP 的时间塞进这段空档，
                       # 由 checkin.py 的 wait_for_target 精确等到目标秒（误差 <5s）
 BAD_MINUTES = {0, 1, 2, 58, 59}
