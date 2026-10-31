@@ -42,8 +42,8 @@ jobs:
     name: checkin
     # 可选：仓库变量 RUNNER_LABEL 设为自托管 runner 标签（如 [self-hosted, windows]）
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
-    # 闸门最多等 55 分钟 + 签到本身约 3 分钟；更长等待会被 runner 回收（10-29 实测 112 分钟）
-    timeout-minutes: 75
+    # 闸门最多等 85 分钟 + 签到本身约 3 分钟；112 分钟的长等待会被 runner 回收（10-29 实测）
+    timeout-minutes: 100
     steps:
       - name: Checkout
         uses: actions/checkout@v4

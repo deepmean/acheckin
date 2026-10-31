@@ -49,7 +49,8 @@ from pathlib import Path
 CST = dt.timezone(dt.timedelta(hours=8))
 BASE_MINUTE = 5       # 与 cron 的分钟对齐
 OFF_MAX = 300         # 随机偏移上限（分钟）
-WAIT_AHEAD = 55       # 目标在未来这么多分钟内才等；>60 分钟的长等待会被 runner 回收（10-29 实测 112 分钟被杀）
+WAIT_AHEAD = 85       # 目标在未来这么多分钟内才等。112 分钟的长等待会被 runner 判失联杀掉
+                      # （2026-10-29 实测），85 分钟仍留有余量；心跳日志每 5 分钟一次保持活跃
 LEAD_SECONDS = 120    # 只等到目标前 2 分钟就放行，把装 WARP 的时间塞进这段空档，
                       # 由 checkin.py 的 wait_for_target 精确等到目标秒（误差 <5s）
 BAD_MINUTES = {0, 1, 2, 58, 59}
@@ -128,13 +129,14 @@ def slot_target(rows: list[dict], now: dt.datetime, slot: str) -> dt.datetime:
 
 
 def sleep_until(target: dt.datetime) -> None:
+    """等到 target。心跳日志每 5 分钟一次，避免 runner 认为 job 长时间无活动。"""
     while True:
         left = (target - dt.datetime.now(CST)).total_seconds()
         if left <= 0:
             return
-        if left > 600:
+        if left > 300:
             print(f"[gate] 距目标还有 {left / 60:.0f} 分钟，继续等待", flush=True)
-            time.sleep(600)
+            time.sleep(min(300, left - 240))
         else:
             print(f"[gate] 最后等待 {left:.0f}s", flush=True)
             time.sleep(left)
