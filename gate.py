@@ -108,11 +108,11 @@ def all_rows() -> list[dict]:
     return rows
 
 
-def required_accounts() -> dict[str, set[str]]:
-    """需要多账号的站点：文件名 -> 必须全部成功的账号集合。
+def required_accounts() -> set[str]:
+    """DGB 站需要多账号：这些账号当天都成功，槽位才算完成。
 
-    DGB 站支持多账号，历史记录里带 account 字段；只有所有账号当天都成功，
-    这个槽位才算完成，否则后续 cron 会继续重试没签成的那个账号。
+    账号列表来自 DGB_ACCOUNTS（优先）或 DGB_USERNAME[_2]。
+    判定不绑定文件名——只要历史文件里出现 account 字段，就按账号集合校验。
     """
     names: set[str] = set()
     raw = (os.getenv("DGB_ACCOUNTS") or "").strip()
@@ -133,10 +133,10 @@ def required_accounts() -> dict[str, set[str]]:
         if v:
             names.add(v)
     names.discard("")
-    return {"state/history_dgb.jsonl": names} if names else {}
+    return names
 
 
-REQUIRED = required_accounts()
+ACCOUNTS_REQUIRED = required_accounts()
 
 
 def done_slots(rows: list[dict], today: str, by_file: bool = True) -> set[str]:
@@ -149,17 +149,18 @@ def done_slots(rows: list[dict], today: str, by_file: bool = True) -> set[str]:
         path = (ROOT / rel) if not os.path.isabs(rel) else Path(rel)
         local_rows = [r for r in history_rows(path)
                       if r.get("date_cst") == today and r.get("success") and r.get("slot")]
-        acct_req = REQUIRED.get(rel.replace("\\", "/")) or set()
-        if acct_req:
+        per_account = ACCOUNTS_REQUIRED and any(r.get("account") for r in local_rows)
+        if per_account:
             local = set()
             for slot in {str(r["slot"]) for r in local_rows}:
                 have = {str(r.get("account") or "") for r in local_rows
                         if str(r["slot"]) == slot}
-                if acct_req.issubset(have):
+                if ACCOUNTS_REQUIRED.issubset(have):
                     local.add(slot)
-                elif not any(have - {""}):
-                    # 旧记录没有 account 字段时无法判定归属，视为未完成（重签是幂等的）
-                    print(f"[gate] {rel} 槽位 {slot} 有记录但缺 account 字段，视为未完成")
+                else:
+                    miss = sorted(ACCOUNTS_REQUIRED - have - {""})
+                    if miss:
+                        print(f"[gate] {rel} 槽位 {slot} 还缺账号 {miss}，视为未完成")
         else:
             local = {str(r["slot"]) for r in local_rows}
         done = local if done is None else (done & local)
