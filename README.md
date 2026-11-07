@@ -32,7 +32,22 @@ state/history_dgb.jsonl        DGB 每日结果（含 slot / 奖励额度）
 | `POST /api/user/checkin` | 执行签到，奖励在 `min_quota`~`max_quota` 之间随机（本站 15,000,000~25,555,000） |
 
 重复签到返回 `HTTP 200 + {"message":"Already checked in today","success":false}` ——
-脚本把这种当「今天已签到」处理，不算失败。实测一次奖励 **21,740,906（约 $43.48）**。
+脚本把这种当「今天已签到」处理，不算失败。实测奖励区间 15,000,000~25,555,000。
+
+### 多账号
+
+DGB 支持多账号同跑，账号来源优先级：
+
+1. `DGB_ACCOUNTS` —— JSON 数组，推荐：
+   ```json
+   [{"username":"acc1","password":"p1"},{"username":"acc2","password":"p2"}]
+   ```
+2. `DGB_USERNAME` / `DGB_PASSWORD`（第 1 个）
+3. `DGB_USERNAME_2` / `DGB_PASSWORD_2`（第 2 个）
+
+每个账号独立登录、独立签到、独立落盘（`history_dgb.jsonl` 每条带 `account` 字段），
+**某个账号失败不影响其它账号**。`gate.py` 的完成判定也按账号算：
+只有该站点**所有账号**当天该槽位都成功，槽位才算完成，否则后续 cron 继续重试缺的那个。
 
 ## 一、AgentRouter 站点签到机制（2026-10 实测）
 
@@ -196,8 +211,9 @@ WARP 免费、无需账号；日志里会明确写出 `via=socks5h://...` 还是
 | --- | --- | --- |
 | `AGENTROUTER_USERNAME` | ✅ | AgentRouter 登录邮箱 |
 | `AGENTROUTER_PASSWORD` | ✅ | AgentRouter 登录密码 |
-| `DGB_USERNAME` | ✅ | DGB 公益站用户名 |
-| `DGB_PASSWORD` | ✅ | DGB 公益站密码 |
+| `DGB_USERNAME` | ✅ | DGB 公益站用户名（单账号时用） |
+| `DGB_PASSWORD` | ✅ | DGB 公益站密码（单账号时用） |
+| `DGB_ACCOUNTS` | ⬜ | 多账号 JSON 数组，设了它优先于上面两个 |
 | `TG_BOT_TOKEN` | ⬜ | Telegram 推送 bot token |
 | `TG_CHAT_ID` | ⬜ | Telegram 推送 chat id |
 

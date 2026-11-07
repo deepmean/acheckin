@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DGB 公益站（freeapi.dgbmc.top）每日自动签到
+DGB 公益站（freeapi.dgbmc.top）每日自动签到 —— 多账号版
 站点: https://freeapi.dgbmc.top   （New API v1.0.0-rc.47）
 
 一、站点机制（2026-11 实测）
@@ -18,14 +18,21 @@ DGB 公益站（freeapi.dgbmc.top）每日自动签到
      重复 → HTTP 200 + {"message":"Already checked in today","success":false}
             （这是「今天已签」，不是失败）
 
-二、调度
+二、多账号
+  账号来源（优先级从高到低）：
+    · DGB_ACCOUNTS  —— JSON 数组，如
+        [{"username":"a","password":"p1"},{"username":"b","password":"p2"}]
+    · DGB_USERNAME / DGB_PASSWORD          （第 1 个账号）
+    · DGB_USERNAME_2 / DGB_PASSWORD_2      （第 2 个账号）
+  每个账号独立登录、独立签到、独立记录；某个账号失败不影响其它账号。
+
+三、调度
   与 AgentRouter 完全同一套规则：每天两个随机时间、严格间隔 12 小时、分钟避开整点。
-  由 workflow 里的 gate.py 统一算槽位，把 SLOT / SLOT_TARGET 传给本脚本；
-  本脚本自己再读 state/history_dgb.jsonl 去重，同一槽位当天不重复签。
+  workflow 的 gate.py 统一算槽位，把 SLOT / SLOT_TARGET 传进来；
+  本脚本按「账号 + 槽位」去重，同一账号当天同一槽位不会重复签。
 
 环境变量
-  DGB_USERNAME   必填
-  DGB_PASSWORD   必填
+  DGB_ACCOUNTS / DGB_USERNAME(_2) / DGB_PASSWORD(_2)  见上
   DGB_BASE       可选，默认 https://freeapi.dgbmc.top
   SLOT           可选，A / B / manual
   SLOT_TARGET    可选，目标时间（ISO），未到点则先等
@@ -43,8 +50,6 @@ from pathlib import Path
 import requests
 
 BASE = (os.getenv("DGB_BASE") or "https://freeapi.dgbmc.top").rstrip("/")
-USERNAME = (os.getenv("DGB_USERNAME") or "").strip()
-PASSWORD = os.getenv("DGB_PASSWORD") or ""
 SLOT = (os.getenv("SLOT") or "manual").strip() or "manual"
 SLOT_TARGET = (os.getenv("SLOT_TARGET") or "").strip()
 TG_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
@@ -76,6 +81,41 @@ def quota_str(q) -> str:
     return f"{q:,} (约 ${q / QUOTA_PER_UNIT:,.2f})"
 
 
+# ------------------------------- 账号来源 ------------------------------- #
+def load_accounts() -> list[dict]:
+    """返回 [{'username':..,'password':..}, ...]，顺序稳定、去重。"""
+    accounts: list[dict] = []
+    seen: set[str] = set()
+
+    def push(user: str | None, pwd: str | None) -> None:
+        u = (user or "").strip()
+        p = pwd or ""
+        if not u or not p or u in seen:
+            return
+        seen.add(u)
+        accounts.append({"username": u, "password": p})
+
+    raw = (os.getenv("DGB_ACCOUNTS") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for item in parsed if isinstance(parsed, list) else []:
+                if isinstance(item, dict):
+                    push(item.get("username") or item.get("user"), item.get("password") or item.get("pass"))
+                elif isinstance(item, str) and ":" in item:
+                    u, _, p = item.partition(":")
+                    push(u, p)
+        except ValueError as exc:
+            log(f"DGB_ACCOUNTS 解析失败（{exc}），回退到 DGB_USERNAME* 变量")
+
+    push(os.getenv("DGB_USERNAME"), os.getenv("DGB_PASSWORD"))
+    push(os.getenv("DGB_USERNAME_2"), os.getenv("DGB_PASSWORD_2"))
+    return accounts
+
+
+# --------------------------------- 历史 --------------------------------- #
 def history_rows() -> list[dict]:
     if not HISTORY.exists():
         return []
@@ -91,9 +131,11 @@ def history_rows() -> list[dict]:
     return rows
 
 
-def already_done(today: str, slot: str) -> bool:
-    for r in history_rows():
-        if r.get("date_cst") == today and r.get("success") and r.get("slot") == slot:
+def already_done(rows: list[dict], today: str, slot: str, account: str) -> bool:
+    for r in rows:
+        if r.get("date_cst") != today or not r.get("success") or r.get("slot") != slot:
+            continue
+        if str(r.get("account") or "") == account:
             return True
     return False
 
@@ -104,6 +146,7 @@ def append_history(rec: dict) -> None:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+# --------------------------------- 通知 --------------------------------- #
 def write_step_summary(lines: list[str]) -> None:
     path = os.getenv("GITHUB_STEP_SUMMARY")
     if not path:
@@ -141,6 +184,7 @@ def wait_for_target() -> None:
         time.sleep(delta)
 
 
+# -------------------------------- HTTP --------------------------------- #
 def new_session() -> requests.Session:
     s = requests.Session()
     s.trust_env = False
@@ -155,43 +199,43 @@ def new_session() -> requests.Session:
     return s
 
 
-def login(s: requests.Session, attempts: int = 3) -> str:
+def login(s: requests.Session, user: str, pwd: str, attempts: int = 3) -> str:
     last = "未知错误"
     for i in range(1, attempts + 1):
         try:
             r = s.post(f"{BASE}/api/user/login?turnstile=",
-                       json={"username": USERNAME, "password": PASSWORD}, timeout=40)
+                       json={"username": user, "password": pwd}, timeout=40)
             body = r.json()
             if body.get("success") and isinstance(body.get("data"), dict):
                 token = body["data"].get("access_token")
                 if token:
                     return token
-                last = f"登录成功但无 access_token: {str(body)[:200]}"
+                last = f"登录成功但无 access_token: {str(body)[:160]}"
             else:
                 last = f"登录被拒: {body.get('message') or body}"
-                if "密码" in str(last) or "password" in str(last).lower():
-                    raise RuntimeError(last)
-            log(f"第 {i}/{attempts} 次登录失败：{last}")
+                low = str(last).lower()
+                if "密码" in last or "password" in low or "credential" in low or "invalid" in low:
+                    raise RuntimeError(last)   # 凭据错误不重试
+            log(f"  {user} 第 {i}/{attempts} 次登录失败：{last}")
         except RuntimeError:
             raise
         except requests.RequestException as exc:
             last = f"{type(exc).__name__}: {exc}"
-            log(f"第 {i}/{attempts} 次网络异常：{last}")
+            log(f"  {user} 第 {i}/{attempts} 次网络异常：{last}")
         except ValueError:
             last = f"HTTP {r.status_code} 非 JSON: {r.text[:160]}"
-            log(f"第 {i}/{attempts} 次：{last}")
+            log(f"  {user} 第 {i}/{attempts} 次：{last}")
         if i < attempts:
             time.sleep(4 * i)
     raise RuntimeError(f"登录重试 {attempts} 次仍失败: {last}")
 
 
-def get_checkin_stats(s: requests.Session, token: str) -> dict:
+def get_json(s: requests.Session, token: str, path: str, timeout: int = 30) -> dict:
     try:
-        r = s.get(f"{BASE}/api/user/checkin",
-                  headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        return (r.json() or {}).get("data") or {}
+        r = s.get(BASE + path, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        return r.json() or {}
     except Exception as exc:  # noqa: BLE001
-        log(f"读取签到状态失败（不影响后续）：{type(exc).__name__}: {exc}")
+        log(f"GET {path} 失败：{type(exc).__name__}: {exc}")
         return {}
 
 
@@ -219,103 +263,125 @@ def do_checkin(s: requests.Session, token: str) -> tuple[bool, str, dict]:
     return False, f"签到失败: {msg or str(body)[:200]}", body
 
 
-def main() -> int:
-    if not USERNAME or not PASSWORD:
-        log("缺少 DGB_USERNAME / DGB_PASSWORD")
-        return 2
-
-    wait_for_target()
-    today = now_cst().strftime("%Y-%m-%d")
-
-    if SLOT in ("A", "B") and already_done(today, SLOT):
-        log(f"槽位 {SLOT} 今天已成功，跳过")
-        write_step_summary([f"### DGB 签到 `{today}`（槽位 {SLOT}）", "", "今天该槽位已完成，跳过。"])
-        return 0
-
-    log(f"开始签到 {BASE} | 账号 {USERNAME} | 日期 {today} | 槽位 {SLOT}")
+# ------------------------------- 单账号流程 ------------------------------- #
+def run_account(acc: dict, today: str, rows: list[dict]) -> dict:
+    user = acc["username"]
+    if SLOT in ("A", "B") and already_done(rows, today, SLOT, user):
+        log(f"{user}: 槽位 {SLOT} 今天已成功，跳过")
+        return {"account": user, "success": True, "detail": "槽位已完成", "skipped": True}
 
     s = new_session()
     try:
-        token = login(s)
+        token = login(s, user, acc["password"])
     except RuntimeError as exc:
-        err = str(exc)
-        log(err)
-        append_history({"date_cst": today, "ts": now_cst().isoformat(timespec="seconds"),
-                        "slot": SLOT, "success": False, "error": err[:400]})
-        write_step_summary([f"### DGB 签到 `{today}`（槽位 {SLOT}）失败", "", f"```\n{err}\n```"])
-        tg_notify(f"❌ DGB 签到失败 {today} 槽位{SLOT}\n{err[:300]}")
-        return 1
+        log(f"{user}: {exc}")
+        return {"account": user, "success": False, "error": str(exc)}
 
-    stats = get_checkin_stats(s, token)
+    stats = (get_json(s, token, "/api/user/checkin").get("data") or {})
     st = stats.get("stats") or {}
-    before_quota = None
-    try:
-        r0 = s.get(f"{BASE}/api/user/self",
-                   headers={"Authorization": f"Bearer {token}"}, timeout=25)
-        before_quota = ((r0.json() or {}).get("data") or {}).get("quota")
-    except Exception:  # noqa: BLE001
-        pass
 
+    before = (get_json(s, token, "/api/user/self").get("data") or {}).get("quota")
     if st.get("checked_in_today"):
         ok, detail, body = True, "今天已签到（服务端状态）", {}
-        log(f"服务端显示今天已签到，跳过 POST。累计 {st.get('checkin_count')} 次，"
-            f"累计奖励 {quota_str(st.get('total_quota'))}")
+        log(f"{user}: 服务端显示今天已签到，跳过 POST。累计 {st.get('checkin_count')} 次")
     else:
         ok, detail, body = do_checkin(s, token)
-        log(detail)
+        log(f"{user}: {detail}")
 
-    stats2 = get_checkin_stats(s, token)
+    stats2 = (get_json(s, token, "/api/user/checkin").get("data") or {})
     st2 = stats2.get("stats") or {}
-    after_quota = None
-    try:
-        r1 = s.get(f"{BASE}/api/user/self",
-                   headers={"Authorization": f"Bearer {token}"}, timeout=25)
-        after_quota = ((r1.json() or {}).get("data") or {}).get("quota")
-    except Exception:  # noqa: BLE001
-        pass
+    after = (get_json(s, token, "/api/user/self").get("data") or {}).get("quota")
 
     awarded = None
-    if before_quota is not None and after_quota is not None:
+    if before is not None and after is not None:
         try:
-            awarded = int(after_quota) - int(before_quota)
+            awarded = int(after) - int(before)
         except (TypeError, ValueError):
             awarded = None
     if not awarded:
         recs = st2.get("records") or []
-        if recs and recs[-1].get("checkin_date") == today:
-            awarded = recs[-1].get("quota_awarded")
-    if not awarded:
-        d = body.get("data") if isinstance(body, dict) else None
+        if recs and recs[0].get("checkin_date") == today:
+            awarded = recs[0].get("quota_awarded")
+    if not awarded and isinstance(body, dict):
+        d = body.get("data")
         if isinstance(d, dict):
             awarded = d.get("quota_awarded") or d.get("quota")
 
-    rec = {
-        "date_cst": today,
-        "ts": now_cst().isoformat(timespec="seconds"),
-        "slot": SLOT,
+    return {
+        "account": user,
         "success": bool(ok),
         "detail": detail,
-        "checked_in_today": bool(st2.get("checked_in_today")),
         "awarded": awarded,
+        "checked_in_today": bool(st2.get("checked_in_today")),
         "checkin_count": st2.get("checkin_count"),
         "total_quota": st2.get("total_quota"),
-        "quota_after": after_quota,
-        "user_id": stats.get("user_id"),
+        "quota_after": after,
     }
-    append_history(rec)
-    write_step_summary([
-        f"### DGB 签到 `{today}`（槽位 {SLOT}）", "",
-        f"- 结论：**{detail}**",
-        f"- 今日是否已签：`{st2.get('checked_in_today')}`",
-        f"- 本次奖励：{quota_str(awarded) if awarded else '—'}",
-        f"- 当前额度：{quota_str(after_quota) if after_quota is not None else '—'}",
-        f"- 累计签到：{st2.get('checkin_count')} 次 / {quota_str(st2.get('total_quota'))}",
-        f"- 时间：{rec['ts']}",
-    ])
-    tg_notify(f"{'✅' if ok else '❌'} DGB {today} 槽位{SLOT} {detail}\n"
-              f"奖励 {quota_str(awarded) if awarded else '—'}\n"
-              f"额度 {quota_str(after_quota) if after_quota is not None else '—'}")
-    return 0 if ok else 1
+
+
+def main() -> int:
+    accounts = load_accounts()
+    if not accounts:
+        log("没有可用账号（DGB_ACCOUNTS / DGB_USERNAME* 都为空）")
+        return 2
+
+    wait_for_target()
+    today = now_cst().strftime("%Y-%m-%d")
+    log(f"开始签到 {BASE} | 账号数 {len(accounts)} | 日期 {today} | 槽位 {SLOT}")
+
+    rows = history_rows()
+    results: list[dict] = []
+    for acc in accounts:
+        try:
+            res = run_account(acc, today, rows)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{acc['username']}: 未预期异常 {type(exc).__name__}: {exc}")
+            res = {"account": acc["username"], "success": False,
+                   "error": f"{type(exc).__name__}: {exc}"}
+        results.append(res)
+
+        if not res.get("skipped"):
+            rec = {
+                "date_cst": today,
+                "ts": now_cst().isoformat(timespec="seconds"),
+                "slot": SLOT,
+                "account": res["account"],
+                "success": bool(res.get("success")),
+                "detail": res.get("detail") or res.get("error"),
+                "checked_in_today": res.get("checked_in_today"),
+                "awarded": res.get("awarded"),
+                "checkin_count": res.get("checkin_count"),
+                "total_quota": res.get("total_quota"),
+                "quota_after": res.get("quota_after"),
+            }
+            append_history(rec)
+
+    ok_count = sum(1 for r in results if r.get("success"))
+    failed = [r for r in results if not r.get("success")]
+
+    lines = [f"### DGB 签到 `{today}`（槽位 {SLOT}）", "",
+             f"账号 {ok_count}/{len(results)} 成功", "",
+             "| 账号 | 结果 | 本次奖励 | 当前额度 | 累计 |",
+             "| --- | --- | --- | --- | --- |"]
+    for r in results:
+        lines.append("| `{}` | {} | {} | {} | {} 次 |".format(
+            r["account"],
+            r.get("detail") or r.get("error") or "—",
+            quota_str(r["awarded"]) if r.get("awarded") else "—",
+            quota_str(r["quota_after"]) if r.get("quota_after") is not None else "—",
+            r.get("checkin_count") or "—",
+        ))
+    write_step_summary(lines)
+
+    summary = "；".join(f"{r['account']}={'OK' if r.get('success') else 'FAIL'}" for r in results)
+    tg_notify(f"{'✅' if not failed else '⚠️'} DGB {today} 槽位{SLOT} {ok_count}/{len(results)}\n{summary}")
+
+    if failed:
+        for r in failed:
+            log(f"失败：{r['account']} -> {r.get('detail') or r.get('error')}")
+        return 1
+    log(f"全部账号签到完成：{summary}")
+    return 0
 
 
 if __name__ == "__main__":

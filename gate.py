@@ -108,16 +108,60 @@ def all_rows() -> list[dict]:
     return rows
 
 
+def required_accounts() -> dict[str, set[str]]:
+    """需要多账号的站点：文件名 -> 必须全部成功的账号集合。
+
+    DGB 站支持多账号，历史记录里带 account 字段；只有所有账号当天都成功，
+    这个槽位才算完成，否则后续 cron 会继续重试没签成的那个账号。
+    """
+    names: set[str] = set()
+    raw = (os.getenv("DGB_ACCOUNTS") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for item in parsed if isinstance(parsed, list) else []:
+                if isinstance(item, dict) and item.get("username"):
+                    names.add(str(item["username"]).strip())
+                elif isinstance(item, str) and ":" in item:
+                    names.add(item.split(":", 1)[0].strip())
+        except ValueError:
+            pass
+    for env_key in ("DGB_USERNAME", "DGB_USERNAME_2"):
+        v = (os.getenv(env_key) or "").strip()
+        if v:
+            names.add(v)
+    names.discard("")
+    return {"state/history_dgb.jsonl": names} if names else {}
+
+
+REQUIRED = required_accounts()
+
+
 def done_slots(rows: list[dict], today: str, by_file: bool = True) -> set[str]:
-    """槽位完成 = 每个站点都有一条成功记录。"""
+    """槽位完成 = 每个站点（以及该站点的每个账号）都有一条成功记录。"""
     if not by_file:
         return {str(r["slot"]) for r in rows
                 if r.get("date_cst") == today and r.get("success") and r.get("slot")}
     done: set[str] | None = None
     for rel in HISTORY_FILES:
         path = (ROOT / rel) if not os.path.isabs(rel) else Path(rel)
-        local = {str(r["slot"]) for r in history_rows(path)
-                 if r.get("date_cst") == today and r.get("success") and r.get("slot")}
+        local_rows = [r for r in history_rows(path)
+                      if r.get("date_cst") == today and r.get("success") and r.get("slot")]
+        acct_req = REQUIRED.get(rel.replace("\\", "/")) or set()
+        if acct_req:
+            local = set()
+            for slot in {str(r["slot"]) for r in local_rows}:
+                have = {str(r.get("account") or "") for r in local_rows
+                        if str(r["slot"]) == slot}
+                if acct_req.issubset(have):
+                    local.add(slot)
+                elif not any(have - {""}):
+                    # 旧记录没有 account 字段时无法判定归属，视为未完成（重签是幂等的）
+                    print(f"[gate] {rel} 槽位 {slot} 有记录但缺 account 字段，视为未完成")
+        else:
+            local = {str(r["slot"]) for r in local_rows}
         done = local if done is None else (done & local)
     return done or set()
 

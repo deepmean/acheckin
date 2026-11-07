@@ -61,6 +61,8 @@ jobs:
           SLOT: ${{ github.event.inputs.slot || 'auto' }}
           SLOT_MODE: wait
           HISTORY_FILES: state/history.jsonl,state/history_dgb.jsonl
+          # 多账号：槽位只有在「所有站点、所有账号」都成功后才算完成
+          DGB_ACCOUNTS: ${{ secrets.DGB_ACCOUNTS }}
         run: python gate.py
 
       - name: Install dependencies
@@ -112,11 +114,13 @@ jobs:
 
       # DGB 公益站（freeapi.dgbmc.top）：与 AgentRouter 同一套随机槽位规则。
       # 该站没有 IP 信誉拦截，直连即可，不需要 WARP。
+      # 多账号：DGB_ACCOUNTS（JSON 数组）优先，回退 DGB_USERNAME/DGB_PASSWORD。
       - name: Run check-in (DGB)
         id: dgb
         if: steps.gate.outputs.skip != '1'
         continue-on-error: true
         env:
+          DGB_ACCOUNTS: ${{ secrets.DGB_ACCOUNTS }}
           DGB_USERNAME: ${{ secrets.DGB_USERNAME }}
           DGB_PASSWORD: ${{ secrets.DGB_PASSWORD }}
           DGB_BASE: ${{ vars.DGB_BASE || 'https://freeapi.dgbmc.top' }}
