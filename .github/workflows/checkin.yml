@@ -60,6 +60,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SLOT: ${{ github.event.inputs.slot || 'auto' }}
           SLOT_MODE: wait
+          HISTORY_FILES: state/history.jsonl,state/history_dgb.jsonl
         run: python gate.py
 
       - name: Install dependencies
@@ -93,8 +94,10 @@ jobs:
           warp-cli --accept-tos status
           if [ "$ready" != "1" ]; then echo "::warning::WARP socks5 未就绪，将回落到直连"; fi
 
-      - name: Run check-in
+      - name: Run check-in (AgentRouter)
+        id: ar
         if: steps.gate.outputs.skip != '1'
+        continue-on-error: true
         env:
           AGENTROUTER_USERNAME: ${{ secrets.AGENTROUTER_USERNAME }}
           AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
@@ -107,13 +110,39 @@ jobs:
           DEBUG_DUMP: ${{ vars.DEBUG_DUMP }}
         run: python checkin.py
 
+      # DGB 公益站（freeapi.dgbmc.top）：与 AgentRouter 同一套随机槽位规则。
+      # 该站没有 IP 信誉拦截，直连即可，不需要 WARP。
+      - name: Run check-in (DGB)
+        id: dgb
+        if: steps.gate.outputs.skip != '1'
+        continue-on-error: true
+        env:
+          DGB_USERNAME: ${{ secrets.DGB_USERNAME }}
+          DGB_PASSWORD: ${{ secrets.DGB_PASSWORD }}
+          DGB_BASE: ${{ vars.DGB_BASE || 'https://freeapi.dgbmc.top' }}
+          SLOT: ${{ steps.gate.outputs.slot }}
+          SLOT_TARGET: ${{ steps.gate.outputs.target }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python checkin_dgb.py
+
+      - name: Verify both sites
+        if: steps.gate.outputs.skip != '1'
+        run: |
+          echo "AgentRouter outcome: ${{ steps.ar.outcome }}"
+          echo "DGB outcome: ${{ steps.dgb.outcome }}"
+          if [ "${{ steps.ar.outcome }}" != "success" ] || [ "${{ steps.dgb.outcome }}" != "success" ]; then
+            echo "::error::至少一个站点签到失败"
+            exit 1
+          fi
+
       - name: Persist history
         if: always()
         run: |
           set -e
           git config user.name  "agentrouter-bot"
           git config user.email "agentrouter-bot@users.noreply.github.com"
-          git add state/history.jsonl 2>/dev/null || true
+          git add state/history.jsonl state/history_dgb.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "history 无变化，跳过提交"
             exit 0

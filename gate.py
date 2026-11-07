@@ -56,7 +56,10 @@ LEAD_SECONDS = 120    # 只等到目标前 2 分钟就放行，把装 WARP 的�
 BAD_MINUTES = {0, 1, 2, 58, 59}
 
 ROOT = Path(__file__).resolve().parent
-HISTORY = ROOT / "state" / "history.jsonl"
+# 多个站点的历史文件，用逗号分隔；槽位只有在「所有站点都成功」时才算完成，
+# 这样某个站点漏签时，后续 cron 还会继续重试它。
+HISTORY_FILES = [p.strip() for p in
+                 (os.getenv("HISTORY_FILES") or "state/history.jsonl").split(",") if p.strip()]
 
 
 def offset_minutes(now: dt.datetime) -> int:
@@ -83,11 +86,11 @@ def plan_text(now: dt.datetime) -> str:
             f"B={p['B'][0]:02d}:{p['B'][1]:02d} (北京时间, 间隔 12 小时)")
 
 
-def history_rows() -> list[dict]:
-    if not HISTORY.exists():
+def history_rows(path: Path) -> list[dict]:
+    if not path.exists():
         return []
     rows = []
-    for line in HISTORY.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -98,12 +101,29 @@ def history_rows() -> list[dict]:
     return rows
 
 
-def done_slots(rows: list[dict], today: str) -> set[str]:
-    return {str(r["slot"]) for r in rows
-            if r.get("date_cst") == today and r.get("success") and r.get("slot")}
+def all_rows() -> list[dict]:
+    rows: list[dict] = []
+    for rel in HISTORY_FILES:
+        rows.extend(history_rows((ROOT / rel) if not os.path.isabs(rel) else Path(rel)))
+    return rows
+
+
+def done_slots(rows: list[dict], today: str, by_file: bool = True) -> set[str]:
+    """槽位完成 = 每个站点都有一条成功记录。"""
+    if not by_file:
+        return {str(r["slot"]) for r in rows
+                if r.get("date_cst") == today and r.get("success") and r.get("slot")}
+    done: set[str] | None = None
+    for rel in HISTORY_FILES:
+        path = (ROOT / rel) if not os.path.isabs(rel) else Path(rel)
+        local = {str(r["slot"]) for r in history_rows(path)
+                 if r.get("date_cst") == today and r.get("success") and r.get("slot")}
+        done = local if done is None else (done & local)
+    return done or set()
 
 
 def slot_actual_ts(rows: list[dict], today: str, slot: str) -> dt.datetime | None:
+    """取该槽位当天最早的一次成功时刻（多站点之间只差几秒）。"""
     found = None
     for r in rows:
         if r.get("date_cst") != today or r.get("slot") != slot or not r.get("success"):
@@ -111,9 +131,11 @@ def slot_actual_ts(rows: list[dict], today: str, slot: str) -> dt.datetime | Non
         if not r.get("ts"):
             continue
         try:
-            found = dt.datetime.fromisoformat(r["ts"])
+            t = dt.datetime.fromisoformat(r["ts"])
         except ValueError:
             continue
+        if found is None or t < found:
+            found = t
     return found
 
 
@@ -158,7 +180,7 @@ def main() -> int:
         outputs["target"] = now.isoformat(timespec="seconds")
         print("[gate] 手动立即模式 -> 不等待")
     else:
-        rows = history_rows()
+        rows = all_rows()
         done = done_slots(rows, today)
         print(f"[gate] 今日已完成槽位: {sorted(done) or '无'}")
 

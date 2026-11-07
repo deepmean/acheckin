@@ -1,18 +1,40 @@
-# aCheckin — AgentRouter 每日自动签到
+# aCheckin — 多站点每日自动签到
 
-每天在**两个随机时间点**自动登录 <https://agentrouter.org> 完成签到（登录即签到），
-两点严格相隔 **12 小时**、分钟**避开整点**（如今天 04:33 / 16:33，明天 00:19 / 12:19）。
-结果写入 `state/history.jsonl` 并由 Actions 自动提交回仓库。
+每天在**两个随机时间点**自动签到，两点严格相隔 **12 小时**、分钟**避开整点**
+（如今天 04:33 / 16:33，明天 00:19 / 12:19）。
+结果写入 `state/history*.jsonl` 并由 Actions 自动提交回仓库。
+
+已接入：
+
+| 站点 | 脚本 | 历史文件 | 出口 |
+| --- | --- | --- | --- |
+| AgentRouter（agentrouter.org） | `checkin.py` | `state/history.jsonl` | Cloudflare WARP |
+| DGB 公益站（freeapi.dgbmc.top） | `checkin_dgb.py` | `state/history_dgb.jsonl` | 直连 |
 
 ```
 gate.py                        槽位闸门：算当天随机时间，作业内精确等待（纯标准库）
-checkin.py                     签到主程序（登录=签到 + 额度快照 + 历史落盘）
+checkin.py                     签到主程序：AgentRouter（登录=签到 + 额度快照）
+checkin_dgb.py                 签到主程序：DGB 公益站（POST /api/user/checkin）
 requirements.txt               requests[socks]
-.github/workflows/checkin.yml  两次日级 cron（北京 00:05 / 12:05）→ 等到抽中的分钟再签到
-state/history.jsonl            每日签到结果（含 slot 字段 A/B）
+.github/workflows/checkin.yml  每小时 cron → 两个站点依次签到
+state/history.jsonl            AgentRouter 每日结果（含 slot 字段 A/B）
+state/history_dgb.jsonl        DGB 每日结果（含 slot / 奖励额度）
 ```
 
-## 一、站点签到机制（2026-10 实测）
+## 一之一、DGB 公益站（freeapi.dgbmc.top）
+
+与 AgentRouter 完全不同，这个站有**真正的签到接口**（New API v1.0.0-rc.47）：
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /api/user/login?turnstile=` | 返回 `data.access_token`（Bearer），**没有** `New-Api-User` 头 |
+| `GET /api/user/checkin` | 查状态：`stats.checked_in_today` / `checkin_count` / `records[]` |
+| `POST /api/user/checkin` | 执行签到，奖励在 `min_quota`~`max_quota` 之间随机（本站 15,000,000~25,555,000） |
+
+重复签到返回 `HTTP 200 + {"message":"Already checked in today","success":false}` ——
+脚本把这种当「今天已签到」处理，不算失败。实测一次奖励 **21,740,906（约 $43.48）**。
+
+## 一、AgentRouter 站点签到机制（2026-10 实测）
 
 | 端点 | 结果 | 说明 |
 | --- | --- | --- |
@@ -68,6 +90,13 @@ B 班跟随 A 的**实际**执行时刻，所以即使 A 班因调度延迟晚�
 schedule:
   - cron: '5 * * * *'   # 每小时 :05，全天 24 条
 ```
+
+每个 job 依次跑两个站点（同一套随机槽位）：
+
+| 站点 | 脚本 | 出口 |
+| --- | --- | --- |
+| AgentRouter（agentrouter.org） | `checkin.py` | 走 Cloudflare WARP（阿里云 WAF 只认 IP 信誉） |
+| DGB 公益站（freeapi.dgbmc.top） | `checkin_dgb.py` | 直连（无 WAF 拦截） |
 
 每条 cron 只是「醒来问一句」，`gate.py` 决定这次要不要签：
 
@@ -165,8 +194,10 @@ WARP 免费、无需账号；日志里会明确写出 `via=socks5h://...` 还是
 
 | 名称 | 必填 | 说明 |
 | --- | --- | --- |
-| `AGENTROUTER_USERNAME` | ✅ | 登录邮箱 |
-| `AGENTROUTER_PASSWORD` | ✅ | 登录密码 |
+| `AGENTROUTER_USERNAME` | ✅ | AgentRouter 登录邮箱 |
+| `AGENTROUTER_PASSWORD` | ✅ | AgentRouter 登录密码 |
+| `DGB_USERNAME` | ✅ | DGB 公益站用户名 |
+| `DGB_PASSWORD` | ✅ | DGB 公益站密码 |
 | `TG_BOT_TOKEN` | ⬜ | Telegram 推送 bot token |
 | `TG_CHAT_ID` | ⬜ | Telegram 推送 chat id |
 
@@ -175,12 +206,15 @@ WARP 免费、无需账号；日志里会明确写出 `via=socks5h://...` 还是
 | 名称 | 说明 |
 | --- | --- |
 | `AGENTROUTER_BASE` | 站点地址，默认 `https://agentrouter.org` |
+| `DGB_BASE` | 站点地址，默认 `https://freeapi.dgbmc.top` |
 | `RUNNER_LABEL` | 自托管 runner 标签，如 `[self-hosted, windows]`；设了就不装 WARP，走家宽直连 |
 | `DEBUG_DUMP` | 设 `1` 时打印异常响应原文 |
 
 ```bash
 gh secret set AGENTROUTER_USERNAME -R deepmean/acheckin -b 'you@example.com'
 gh secret set AGENTROUTER_PASSWORD -R deepmean/acheckin -b '<密码>'
+gh secret set DGB_USERNAME -R deepmean/acheckin -b '<用户名>'
+gh secret set DGB_PASSWORD -R deepmean/acheckin -b '<密码>'
 ```
 
 ## 六、运行与验证
