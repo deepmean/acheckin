@@ -1,4 +1,4 @@
-name: AgentRouter Daily Check-in
+name: Daily Check-in (AgentRouter + DGB)
 
 # ── 时间机制：每天两个随机时间，严格间隔 12 小时，分钟避开整点 ──────────────
 # gate.py 以北京日期为种子，当天固定生成偏移 off ∈ 0..300 分钟：
