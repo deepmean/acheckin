@@ -212,7 +212,12 @@ def login(s: requests.Session, user: str, pwd: str, attempts: int = 3) -> str:
                     return token
                 last = f"登录成功但无 access_token: {str(body)[:160]}"
             else:
-                last = f"登录被拒: {body.get('message') or body}"
+                code = body.get('code') or 'LOGIN_FAILED'
+                if code == 'AUTH_SESSION_LIMIT':
+                    raise RuntimeError('AUTH_SESSION_LIMIT: 活动登录会话已满；请在已登录设备的 Login sessions 页面撤销旧会话后重跑。')
+                if code == 'AUTH_SESSION_ISSUANCE_LIMIT':
+                    raise RuntimeError('AUTH_SESSION_ISSUANCE_LIMIT: 创建会话频率达到上限，等待服务端滚动窗口恢复后重跑。')
+                last = f"登录被拒 [{code}]: {body.get('message') or '登录失败'}"
                 low = str(last).lower()
                 if "密码" in last or "password" in low or "credential" in low or "invalid" in low:
                     raise RuntimeError(last)   # 凭据错误不重试
@@ -274,9 +279,27 @@ def run_account(acc: dict, today: str, rows: list[dict]) -> dict:
     try:
         token = login(s, user, acc["password"])
     except RuntimeError as exc:
+        s.close()
         log(f"{user}: {exc}")
         return {"account": user, "success": False, "error": str(exc)}
 
+    try:
+        return check_authenticated(s, token, user, today)
+    finally:
+        try:
+            response = s.post(BASE + '/api/user/auth/logout',
+                              headers={'Authorization': f'Bearer {token}'}, timeout=20)
+            if response.json().get('success') is not True:
+                log(f'{user}: 会话退出失败 HTTP {response.status_code}，请检查登录会话列表')
+            else:
+                log(f'{user}: 本次登录会话已注销')
+        except (requests.RequestException, ValueError):
+            log(f'{user}: 会话退出请求异常，请检查登录会话列表')
+        finally:
+            s.close()
+
+
+def check_authenticated(s: requests.Session, token: str, user: str, today: str) -> dict:
     stats = (get_json(s, token, "/api/user/checkin").get("data") or {})
     st = stats.get("stats") or {}
 
