@@ -1,5 +1,7 @@
 # aCheckin — 多站点每日自动签到
 
+**当前：AgentRouter 继续运行；DGB 默认停用，恢复仅支持导入已有会话。**
+
 每天在**两个随机时间点**自动签到，两点严格相隔 **12 小时**、分钟**避开整点**
 （如今天 04:33 / 16:33，明天 00:19 / 12:19）。
 结果写入 `state/history*.jsonl` 并由 Actions 自动提交回仓库。
@@ -21,49 +23,55 @@ state/history.jsonl            AgentRouter 每日结果（含 slot 字段 A/B）
 state/history_dgb.jsonl        DGB 每日结果（含 slot / 奖励额度）
 ```
 
-## 一之一、DGB 公益站（freeapi.dgbmc.top）
+## DGB：仅复用已有会话（默认停用）
 
-与 AgentRouter 完全不同，这个站有**真正的签到接口**（New API v1.0.0-rc.47）：
+DGB 自动签到默认关闭，AgentRouter 独立运行。
+旧版每次密码登录会创建新会话，且未保存 Refresh Cookie，导致历史会话累积；
+仅持有账号密码无法取回这些会话的 Refresh Cookie。本版本已经移除密码登录和自动注销路径。
 
-| 端点 | 说明 |
-| --- | --- |
-| `POST /api/user/login?turnstile=` | 返回 `data.access_token`（Bearer），**没有** `New-Api-User` 头 |
-| `GET /api/user/checkin` | 查状态：`stats.checked_in_today` / `checkin_count` / `records[]` |
-| `POST /api/user/checkin` | 执行签到，奖励在 `min_quota`~`max_quota` 之间随机（本站 15,000,000~25,555,000） |
+### 复用协议
 
-重复签到返回 `HTTP 200 + {"message":"Already checked in today","success":false}` ——
-脚本把这种当「今天已签到」处理，不算失败。实测奖励区间 15,000,000~25,555,000。
+1. 导入现有会话的 `new_api_refresh` Cookie，可同时提供原 `sid`。
+2. `POST /api/user/auth/refresh` 获取短期 Bearer，验证用户名及原 SID 一致。
+3. 接收轮换后的 Refresh Cookie 并立即加密保存；随后查询/执行签到。
+4. 保留该 SID 供下次使用，只关闭本地 HTTP 连接，既不新建登录会话，也不注销原会话。
 
-### 多账号
+| 配置 | 类型 | 用途 |
+| --- | --- | --- |
+| `DGB_ENABLED` | Repository Variable | 只有精确值 `true` 开启，缺省关闭 |
+| `DGB_ACCOUNT_NAMES` | Repository Variable | 用户名 JSON 数组，缺省 `["fjpg5som8g","deepmean"]` |
+| `DGB_SESSIONS` | Secret | 现有会话种子，格式见下 |
+| `DGB_SESSION_KEY` | Secret | Fernet 加密密钥；`Fernet.generate_key()` 生成，保留不变 |
+| `DGB_BASE` | Repository Variable | 缺省 `https://freeapi.dgbmc.top` |
 
-DGB 支持多账号同跑，账号来源优先级：
+`DGB_SESSIONS` 的格式（通过 GitHub Secrets 界面配置）：
 
-1. `DGB_ACCOUNTS` —— JSON 数组，推荐：
-   ```json
-   [{"username":"acc1","password":"p1"},{"username":"acc2","password":"p2"}]
-   ```
-2. `DGB_USERNAME` / `DGB_PASSWORD`（第 1 个）
-3. `DGB_USERNAME_2` / `DGB_PASSWORD_2`（第 2 个）
+```json
+{
+  "account1": {"refresh_cookie": "<existing new_api_refresh value>", "sid": "<existing sid>"},
+  "account2": {"refresh_cookie": "<existing new_api_refresh value>"}
+}
+```
 
-每个账号独立登录、独立签到、独立落盘（`history_dgb.jsonl` 每条带 `account` 字段），
-**某个账号失败不影响其它账号**。`gate.py` 的完成判定也按账号算：
-只有该站点**所有账号**当天该槽位都成功，槽位才算完成，否则后续 cron 继续重试缺的那个。
+请使用一份专用于自动化的已有会话，交由脚本独占刷新；浏览器与脚本同时轮换同一 Cookie
+会造成竞争。导入后不要再让原浏览器刷新该会话，也不要在该浏览器点退出该会话。
+如果已无任何有效 Cookie，DGB 维持停用，待站方释放会话或正常恢复账号后再导入。
 
-### 登录会话维护
+### 跨运行保存与异常处理
 
-DGB 对活动登录会话数量有限制。自动签到在登录后通过 `finally` 调用
-`POST /api/user/auth/logout` 注销本次创建的会话，签到成功、失败和异常退出都会执行清理。
-该操作仅清理本次自动化会话，保留其他设备的登录状态。
+- `state/dgb_sessions.enc` 只存 Fernet 密文，密钥只存在 GitHub Secret；明文 Cookie 和 Bearer 不进入提交、日志或 Actions 输出。
+- 全部运行串行，开始时读取主分支最新状态。旧种子不会覆盖已经轮换的新 Cookie。
+- 在发出刷新请求前，先将绑定 `run_id` 和 `run_attempt` 的准备检查点加密提交远端；提交成功才放行刷新。
+- 刷新中断、失效、账号/SID 不一致或重定向时隔离该会话；下一次运行拒绝重放，不会回退密码登录。
+- 若 runner 丢失或最后提交失败，远端保留的准备标记同样会阻止后续运行重放旧 Cookie。此时需要重新导入有效会话。
+- 即使签到失败，轮换状态也会在 `always()` 步骤保存；关闭 DGB 后，其历史不再参与 AgentRouter 的槽位交集。
+- 每个账号独立记录；复用开启时，只有全部指定账号完成才视为 DGB 槽位完成。
 
-- `AUTH_SESSION_LIMIT`：活动会话已满。请在**报错账号**已登录的设备上进入
-  “登录会话 / Login sessions”，执行“退出其他会话 / Sign out other sessions”，确认撤销生效后重跑。
-- `AUTH_SESSION_ISSUANCE_LIMIT`：短期创建会话次数达到上限，等待服务端滚动窗口恢复后重跑。
-- 上述错误保留原始错误码并立即结束该账号的登录尝试，其他账号继续执行；工作流仍会准确标记失败。
-- 修复仅清理新会话；此前遗留的会话需要从已登录设备释放或等待其过期。
+旧 `DGB_PASSWORD*` 和含密码的 `DGB_ACCOUNTS` Secrets 已从工作流环境移除。
+本地运行同样默认关闭，显式配置 `DGB_ENABLED=true`、会话与密钥才会请求 DGB。
 
-本地运行 `python -m unittest discover -v` 可验证会话生命周期。
-测试使用本地 HTTP 服务，覆盖连续运行、签到失败、异常退出及会话上限，均使用虚拟凭据。
-工作流在签到前执行相同测试。
+安装依赖后执行 `python -m unittest discover -v`，使用本地 HTTP 服务验证：默认停用零请求、
+连续同 SID 刷新、轮换持久化、异常隔离以及缺少会话时零密码登录。所有测试使用虚拟凭据。
 
 ## 一、AgentRouter 站点签到机制（2026-10 实测）
 
@@ -231,9 +239,8 @@ WARP 免费、无需账号；日志里会明确写出 `via=socks5h://...` 还是
 | --- | --- | --- |
 | `AGENTROUTER_USERNAME` | ✅ | AgentRouter 登录邮箱 |
 | `AGENTROUTER_PASSWORD` | ✅ | AgentRouter 登录密码 |
-| `DGB_USERNAME` | ✅ | DGB 公益站用户名（单账号时用） |
-| `DGB_PASSWORD` | ✅ | DGB 公益站密码（单账号时用） |
-| `DGB_ACCOUNTS` | ⬜ | 多账号 JSON 数组，设了它优先于上面两个 |
+| `DGB_SESSIONS` | 可选 | DGB 已有会话 Cookie，仅显式开启复用时需要 |
+| `DGB_SESSION_KEY` | 可选 | Fernet 加密密钥，仅显式开启复用时需要 |
 | `TG_BOT_TOKEN` | ⬜ | Telegram 推送 bot token |
 | `TG_CHAT_ID` | ⬜ | Telegram 推送 chat id |
 
@@ -243,14 +250,15 @@ WARP 免费、无需账号；日志里会明确写出 `via=socks5h://...` 还是
 | --- | --- |
 | `AGENTROUTER_BASE` | 站点地址，默认 `https://agentrouter.org` |
 | `DGB_BASE` | 站点地址，默认 `https://freeapi.dgbmc.top` |
+| `DGB_ENABLED` | 默认 `false`；仅 `true` 开启旧会话复用 |
+| `DGB_ACCOUNT_NAMES` | 用户名 JSON 数组，默认 `["fjpg5som8g","deepmean"]` |
 | `RUNNER_LABEL` | 自托管 runner 标签，如 `[self-hosted, windows]`；设了就不装 WARP，走家宽直连 |
 | `DEBUG_DUMP` | 设 `1` 时打印异常响应原文 |
 
 ```bash
 gh secret set AGENTROUTER_USERNAME -R deepmean/acheckin -b 'you@example.com'
 gh secret set AGENTROUTER_PASSWORD -R deepmean/acheckin -b '<密码>'
-gh secret set DGB_USERNAME -R deepmean/acheckin -b '<用户名>'
-gh secret set DGB_PASSWORD -R deepmean/acheckin -b '<密码>'
+gh variable set DGB_ENABLED -R deepmean/acheckin -b 'false'
 ```
 
 ## 六、运行与验证

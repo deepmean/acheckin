@@ -3,3 +3,5 @@ __pycache__/
 .env
 .venv/
 state/*.tmp
+state/dgb_sessions.json
+state/*cookies*.json

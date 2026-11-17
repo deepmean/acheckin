@@ -1,1 +1,2 @@
 requests[socks]>=2.31.0
+cryptography>=46.0.3,<47

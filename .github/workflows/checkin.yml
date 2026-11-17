@@ -1,26 +1,11 @@
-name: Daily Check-in (AgentRouter + DGB)
+name: Daily Check-in (AgentRouter; DGB opt-in)
 
-# ── 时间机制：每天两个随机时间，严格间隔 12 小时，分钟避开整点 ──────────────
-# gate.py 以北京日期为种子，当天固定生成偏移 off ∈ 0..300 分钟：
-#     槽位 A = 00:05 + off      槽位 B = A 班实际执行时刻 + 12 小时
-#     分钟 m = (5 + off) % 60 ∈ 3..57，永不整点
-# 例：off=125 → A=02:10  B=14:10；off=0 → A=00:05  B=12:05
-#
-# 为什么是「12 条 cron + 闸门」而不是「一条精确 cron」：
-#   实测本仓库 cron 会被丢弃或迟到 2~6 小时（日级 A 班迟到 2h51m / 4h54m；
-#   日级 B 班连续两天整天没触发），单条 cron 无法承担精确时刻。
-#   所以改成全天 12 条（每 2 小时）唤醒，每条只问「现在该不该签」：
-#     目标在 150 分钟内 → 等到目标再签；目标已过 → 立即补签；否则跳过。
-#   任一条丢失都会由下一条接管；槽位当天成功后写 history 去重，不会重复签。
-#
-# 出口 IP：agentrouter.org 前置阿里云 WAF，按 IP 信誉拦截 GitHub 默认出口
-# （Azure 段会收到「滑动验证」挑战页）。因此签到前先拉起 Cloudflare WARP，
-# 用它的 socks5 代理（127.0.0.1:40000）出网，实测可穿过 WAF 完成登录=签到。
+# Each hourly trigger checks the daily targets. GitHub may delay triggers;
+# runtime waiting does not guarantee an exact 12-hour wall-clock interval.
+# DGB defaults off. Enabling it requires an existing refresh session and an
+# encryption key; password credentials are never passed to the DGB steps.
 on:
-  # 每小时一条（UTC :05 = 北京 :05），全天 24 条。
-  # 单条 cron 会被 GitHub 丢掉/延迟 2~6 小时，所以不押注某一条：
-  # 每条只是「醒来看一眼」，闸门决定这次是否该签到（含去重与目标窗口判断）。
-  # 等待窗口只有 40 分钟 —— 实测 112 分钟的长等待会被 runner 判 lost communication 杀掉。
+  # 每小时 :05 检查随机槽位；等待上限由 gate.py 的 WAIT_AHEAD 控制。
   schedule:
     - cron: '5 * * * *'
   workflow_dispatch:
@@ -47,6 +32,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Load latest persisted state
+        run: git pull --ff-only origin main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -61,8 +51,8 @@ jobs:
           SLOT: ${{ github.event.inputs.slot || 'auto' }}
           SLOT_MODE: wait
           HISTORY_FILES: state/history.jsonl,state/history_dgb.jsonl
-          # 多账号：槽位只有在「所有站点、所有账号」都成功后才算完成
-          DGB_ACCOUNTS: ${{ secrets.DGB_ACCOUNTS }}
+          DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
+          DGB_ACCOUNTS: ${{ vars.DGB_ACCOUNT_NAMES || '["fjpg5som8g","deepmean"]' }}
         run: python gate.py
 
       - name: Install dependencies
@@ -116,17 +106,41 @@ jobs:
           DEBUG_DUMP: ${{ vars.DEBUG_DUMP }}
         run: python checkin.py
 
-      # DGB 公益站（freeapi.dgbmc.top）：与 AgentRouter 同一套随机槽位规则。
-      # 该站没有 IP 信誉拦截，直连即可，不需要 WARP。
-      # 多账号：DGB_ACCOUNTS（JSON 数组）优先，回退 DGB_USERNAME/DGB_PASSWORD。
-      - name: Run check-in (DGB)
-        id: dgb
-        if: steps.gate.outputs.skip != '1'
+      - name: Persist DGB refresh checkpoint before network access
+        id: dgb_prepare
+        if: ${{ steps.gate.outputs.skip != '1' && vars.DGB_ENABLED == 'true' }}
         continue-on-error: true
         env:
-          DGB_ACCOUNTS: ${{ secrets.DGB_ACCOUNTS }}
-          DGB_USERNAME: ${{ secrets.DGB_USERNAME }}
-          DGB_PASSWORD: ${{ secrets.DGB_PASSWORD }}
+          DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
+          DGB_ACCOUNTS: ${{ vars.DGB_ACCOUNT_NAMES || '["fjpg5som8g","deepmean"]' }}
+          DGB_SESSIONS: ${{ secrets.DGB_SESSIONS }}
+          DGB_SESSION_KEY: ${{ secrets.DGB_SESSION_KEY }}
+          DGB_SESSION_STATE: state/dgb_sessions.enc
+          DGB_CHECKPOINT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          DGB_BASE: ${{ vars.DGB_BASE || 'https://freeapi.dgbmc.top' }}
+          SLOT: ${{ steps.gate.outputs.slot }}
+        run: |
+          set -e
+          python checkin_dgb.py --prepare
+          git config user.name "agentrouter-bot"
+          git config user.email "agentrouter-bot@users.noreply.github.com"
+          git add -- state/dgb_sessions.enc
+          git commit -m "chore(dgb): checkpoint before refresh"
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+
+      # DGB is opt-in and refresh-only. No password credentials are mounted.
+      - name: Run check-in (DGB existing sessions)
+        id: dgb
+        if: ${{ steps.gate.outputs.skip != '1' && vars.DGB_ENABLED == 'true' && steps.dgb_prepare.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
+          DGB_ACCOUNTS: ${{ vars.DGB_ACCOUNT_NAMES || '["fjpg5som8g","deepmean"]' }}
+          DGB_SESSIONS: ${{ secrets.DGB_SESSIONS }}
+          DGB_SESSION_KEY: ${{ secrets.DGB_SESSION_KEY }}
+          DGB_SESSION_STATE: state/dgb_sessions.enc
+          DGB_CHECKPOINT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           DGB_BASE: ${{ vars.DGB_BASE || 'https://freeapi.dgbmc.top' }}
           SLOT: ${{ steps.gate.outputs.slot }}
           SLOT_TARGET: ${{ steps.gate.outputs.target }}
@@ -134,13 +148,21 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin_dgb.py
 
-      - name: Verify both sites
+      - name: Verify enabled sites
         if: steps.gate.outputs.skip != '1'
+        env:
+          AR_OUTCOME: ${{ steps.ar.outcome }}
+          DGB_OUTCOME: ${{ steps.dgb.outcome }}
+          DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
         run: |
-          echo "AgentRouter outcome: ${{ steps.ar.outcome }}"
-          echo "DGB outcome: ${{ steps.dgb.outcome }}"
-          if [ "${{ steps.ar.outcome }}" != "success" ] || [ "${{ steps.dgb.outcome }}" != "success" ]; then
-            echo "::error::至少一个站点签到失败"
+          echo "AgentRouter outcome: $AR_OUTCOME"
+          echo "DGB enabled: $DGB_ENABLED; outcome: $DGB_OUTCOME"
+          if [ "$AR_OUTCOME" != "success" ]; then
+            echo "::error::AgentRouter check-in failed"
+            exit 1
+          fi
+          if [ "$DGB_ENABLED" = "true" ] && [ "$DGB_OUTCOME" != "success" ]; then
+            echo "::error::DGB existing-session check-in failed"
             exit 1
           fi
 
@@ -150,11 +172,13 @@ jobs:
           set -e
           git config user.name  "agentrouter-bot"
           git config user.email "agentrouter-bot@users.noreply.github.com"
-          git add state/history.jsonl state/history_dgb.jsonl 2>/dev/null || true
+          for path in state/history.jsonl state/history_dgb.jsonl state/dgb_sessions.enc; do
+            if [ -f "$path" ]; then git add -- "$path"; fi
+          done
           if git diff --cached --quiet; then
-            echo "history 无变化，跳过提交"
+            echo "No state changes"
             exit 0
           fi
           git commit -m "chore(checkin): $(TZ=Asia/Shanghai date +%F) slot ${{ steps.gate.outputs.slot }}"
-          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-          git push
+          git pull --rebase origin main
+          git push origin HEAD:main

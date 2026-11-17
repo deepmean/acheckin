@@ -58,8 +58,11 @@ BAD_MINUTES = {0, 1, 2, 58, 59}
 ROOT = Path(__file__).resolve().parent
 # 多个站点的历史文件，用逗号分隔；槽位只有在「所有站点都成功」时才算完成，
 # 这样某个站点漏签时，后续 cron 还会继续重试它。
+DGB_ENABLED = (os.getenv("DGB_ENABLED") or "").strip().lower() == "true"
 HISTORY_FILES = [p.strip() for p in
                  (os.getenv("HISTORY_FILES") or "state/history.jsonl").split(",") if p.strip()]
+if not DGB_ENABLED:
+    HISTORY_FILES = [p for p in HISTORY_FILES if Path(p).name != "history_dgb.jsonl"]
 
 
 def offset_minutes(now: dt.datetime) -> int:
@@ -124,7 +127,7 @@ def required_accounts() -> set[str]:
             for item in parsed if isinstance(parsed, list) else []:
                 if isinstance(item, dict) and item.get("username"):
                     names.add(str(item["username"]).strip())
-                elif isinstance(item, str) and ":" in item:
+                elif isinstance(item, str):
                     names.add(item.split(":", 1)[0].strip())
         except ValueError:
             pass

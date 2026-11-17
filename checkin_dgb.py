@@ -1,51 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-DGB 公益站（freeapi.dgbmc.top）每日自动签到 —— 多账号版
-站点: https://freeapi.dgbmc.top   （New API v1.0.0-rc.47）
+"""DGB check-in using an existing refresh session only.
 
-一、站点机制（2026-11 实测）
-  1. 登录：POST /api/user/login?turnstile=
-     返回 data.access_token（Bearer）+ data.session + data.user
-     与 AgentRouter 不同，这里没有 New-Api-User 头，改用 Authorization: Bearer <token>
-  2. 查询：GET /api/user/checkin
-     {"data":{"enabled":true,"max_quota":25555000,"min_quota":15000000,
-              "stats":{"checked_in_today":true,"checkin_count":1,
-                       "records":[{"checkin_date":"2026-11-07","quota_awarded":21740906}],
-                       "total_checkins":1,"total_quota":21740906}}}
-  3. 签到：POST /api/user/checkin
-     成功 → success=true，奖励在 min_quota ~ max_quota 之间随机
-     重复 → HTTP 200 + {"message":"Already checked in today","success":false}
-            （这是「今天已签」，不是失败）
-
-二、多账号
-  账号来源（优先级从高到低）：
-    · DGB_ACCOUNTS  —— JSON 数组，如
-        [{"username":"a","password":"p1"},{"username":"b","password":"p2"}]
-    · DGB_USERNAME / DGB_PASSWORD          （第 1 个账号）
-    · DGB_USERNAME_2 / DGB_PASSWORD_2      （第 2 个账号）
-  每个账号独立登录、独立签到、独立记录；某个账号失败不影响其它账号。
-
-三、调度
-  与 AgentRouter 完全同一套规则：每天两个随机时间、严格间隔 12 小时、分钟避开整点。
-  workflow 的 gate.py 统一算槽位，把 SLOT / SLOT_TARGET 传进来；
-  本脚本按「账号 + 槽位」去重，同一账号当天同一槽位不会重复签。
-
-环境变量
-  DGB_ACCOUNTS / DGB_USERNAME(_2) / DGB_PASSWORD(_2)  见上
-  DGB_BASE       可选，默认 https://freeapi.dgbmc.top
-  SLOT           可选，A / B / manual
-  SLOT_TARGET    可选，目标时间（ISO），未到点则先等
-  TG_BOT_TOKEN/TG_CHAT_ID 可选，Telegram 推送
+DGB_ENABLED must explicitly be true. DGB_SESSIONS supplies existing
+new_api_refresh cookies; DGB_SESSION_KEY encrypts rotated cookies in
+DGB_SESSION_STATE. Password login and automatic logout are intentionally absent.
+Missing, expired or uncertain sessions fail closed without creating a session.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
@@ -83,17 +54,17 @@ def quota_str(q) -> str:
 
 # ------------------------------- 账号来源 ------------------------------- #
 def load_accounts() -> list[dict]:
-    """返回 [{'username':..,'password':..}, ...]，顺序稳定、去重。"""
+    """Read account names only; legacy password fields are ignored."""
     accounts: list[dict] = []
     seen: set[str] = set()
 
-    def push(user: str | None, pwd: str | None) -> None:
-        u = (user or "").strip()
-        p = pwd or ""
-        if not u or not p or u in seen:
+    def push(user) -> None:
+        if not isinstance(user, str):
             return
-        seen.add(u)
-        accounts.append({"username": u, "password": p})
+        user = user.strip()
+        if user and user not in seen:
+            seen.add(user)
+            accounts.append({"username": user})
 
     raw = (os.getenv("DGB_ACCOUNTS") or "").strip()
     if raw:
@@ -101,17 +72,17 @@ def load_accounts() -> list[dict]:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 parsed = [parsed]
-            for item in parsed if isinstance(parsed, list) else []:
+            if not isinstance(parsed, list):
+                raise ValueError("invalid accounts")
+            for item in parsed:
                 if isinstance(item, dict):
-                    push(item.get("username") or item.get("user"), item.get("password") or item.get("pass"))
-                elif isinstance(item, str) and ":" in item:
-                    u, _, p = item.partition(":")
-                    push(u, p)
-        except ValueError as exc:
-            log(f"DGB_ACCOUNTS 解析失败（{exc}），回退到 DGB_USERNAME* 变量")
-
-    push(os.getenv("DGB_USERNAME"), os.getenv("DGB_PASSWORD"))
-    push(os.getenv("DGB_USERNAME_2"), os.getenv("DGB_PASSWORD_2"))
+                    push(item.get("username") or item.get("user"))
+                elif isinstance(item, str):
+                    push(item.split(":", 1)[0])
+        except (ValueError, TypeError):
+            raise RuntimeError("DGB_ACCOUNTS_INVALID") from None
+    push(os.getenv("DGB_USERNAME"))
+    push(os.getenv("DGB_USERNAME_2"))
     return accounts
 
 
@@ -199,45 +170,49 @@ def new_session() -> requests.Session:
     return s
 
 
-def login(s: requests.Session, user: str, pwd: str, attempts: int = 3) -> str:
-    last = "未知错误"
-    for i in range(1, attempts + 1):
-        try:
-            r = s.post(f"{BASE}/api/user/login?turnstile=",
-                       json={"username": user, "password": pwd}, timeout=40)
-            body = r.json()
-            if body.get("success") and isinstance(body.get("data"), dict):
-                token = body["data"].get("access_token")
-                if token:
-                    return token
-                last = f"登录成功但无 access_token: {str(body)[:160]}"
-            else:
-                code = body.get('code') or 'LOGIN_FAILED'
-                if code == 'AUTH_SESSION_LIMIT':
-                    raise RuntimeError('AUTH_SESSION_LIMIT: 活动登录会话已满；请在已登录设备的 Login sessions 页面撤销旧会话后重跑。')
-                if code == 'AUTH_SESSION_ISSUANCE_LIMIT':
-                    raise RuntimeError('AUTH_SESSION_ISSUANCE_LIMIT: 创建会话频率达到上限，等待服务端滚动窗口恢复后重跑。')
-                last = f"登录被拒 [{code}]: {body.get('message') or '登录失败'}"
-                low = str(last).lower()
-                if "密码" in last or "password" in low or "credential" in low or "invalid" in low:
-                    raise RuntimeError(last)   # 凭据错误不重试
-            log(f"  {user} 第 {i}/{attempts} 次登录失败：{last}")
-        except RuntimeError:
-            raise
-        except requests.RequestException as exc:
-            last = f"{type(exc).__name__}: {exc}"
-            log(f"  {user} 第 {i}/{attempts} 次网络异常：{last}")
-        except ValueError:
-            last = f"HTTP {r.status_code} 非 JSON: {r.text[:160]}"
-            log(f"  {user} 第 {i}/{attempts} 次：{last}")
-        if i < attempts:
-            time.sleep(4 * i)
-    raise RuntimeError(f"登录重试 {attempts} 次仍失败: {last}")
+def refresh_session(s: requests.Session, store, user: str) -> str:
+    entry = store.begin_refresh(user, os.getenv("DGB_CHECKPOINT_ID") or "")
+    origin = urlsplit(BASE)
+    if origin.scheme != "https" and origin.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError("DGB_HTTPS_REQUIRED")
+    s.cookies.set("new_api_refresh", entry["refresh_cookie"],
+                  domain=origin.hostname, path="/api/user/auth",
+                  secure=origin.scheme == "https")
+    headers = {"X-Auth-Session": entry["sid"]} if entry.get("sid") else {}
+    try:
+        response = s.post(BASE + "/api/user/auth/refresh", headers=headers, timeout=30,
+                          allow_redirects=False)
+        if 300 <= response.status_code < 400:
+            raise RuntimeError("DGB_REFRESH_REDIRECT_REJECTED")
+        body = response.json()
+        if not isinstance(body, dict) or body.get("success") is not True:
+            code = body.get("code", "REFRESH_FAILED") if isinstance(body, dict) else "REFRESH_FAILED"
+            code = code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,64}", code) else "REFRESH_FAILED"
+            raise RuntimeError(f"DGB_REFRESH_REJECTED [{code}]")
+        data = body.get("data") or {}
+        token = data.get("access_token")
+        sid = (data.get("session") or {}).get("sid")
+        if (data.get("user") or {}).get("username") != user:
+            raise RuntimeError("DGB_SESSION_ACCOUNT_MISMATCH")
+        if not isinstance(token, str) or not token or not isinstance(sid, str) or not sid:
+            raise RuntimeError("DGB_REFRESH_RESPONSE_INVALID")
+        if entry.get("sid") and entry["sid"] != sid:
+            raise RuntimeError("DGB_SESSION_ID_MISMATCH")
+        cookie = response.cookies.get("new_api_refresh")
+        store.rotated(user, cookie, sid)
+        return token
+    except requests.RequestException:
+        raise RuntimeError("DGB_REFRESH_TRANSPORT_FAILED") from None
+    except (ValueError, AttributeError, TypeError):
+        raise RuntimeError("DGB_REFRESH_RESPONSE_INVALID") from None
 
 
 def get_json(s: requests.Session, token: str, path: str, timeout: int = 30) -> dict:
     try:
-        r = s.get(BASE + path, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        r = s.get(BASE + path, headers={"Authorization": f"Bearer {token}"},
+                  timeout=timeout, allow_redirects=False)
+        if 300 <= r.status_code < 400:
+            raise RuntimeError("DGB_REQUEST_REDIRECT_REJECTED")
         return r.json() or {}
     except Exception as exc:  # noqa: BLE001
         log(f"GET {path} 失败：{type(exc).__name__}: {exc}")
@@ -247,7 +222,10 @@ def get_json(s: requests.Session, token: str, path: str, timeout: int = 30) -> d
 def do_checkin(s: requests.Session, token: str) -> tuple[bool, str, dict]:
     """执行签到。返回 (是否成功, 说明, 原始响应)。"""
     r = s.post(f"{BASE}/api/user/checkin",
-               headers={"Authorization": f"Bearer {token}"}, timeout=40)
+               headers={"Authorization": f"Bearer {token}"}, timeout=40,
+               allow_redirects=False)
+    if 300 <= r.status_code < 400:
+        return False, "DGB_REQUEST_REDIRECT_REJECTED", {}
     try:
         body = r.json()
     except ValueError:
@@ -269,34 +247,22 @@ def do_checkin(s: requests.Session, token: str) -> tuple[bool, str, dict]:
 
 
 # ------------------------------- 单账号流程 ------------------------------- #
-def run_account(acc: dict, today: str, rows: list[dict]) -> dict:
+def run_account(acc: dict, today: str, rows: list[dict], store) -> dict:
     user = acc["username"]
     if SLOT in ("A", "B") and already_done(rows, today, SLOT, user):
         log(f"{user}: 槽位 {SLOT} 今天已成功，跳过")
         return {"account": user, "success": True, "detail": "槽位已完成", "skipped": True}
 
+    # Check before opening a connection; an absent or quarantined cookie must
+    # never trigger password login or fall back to a stale seed.
+    store.get(user, os.getenv("DGB_CHECKPOINT_ID") or "")
     s = new_session()
     try:
-        token = login(s, user, acc["password"])
-    except RuntimeError as exc:
-        s.close()
-        log(f"{user}: {exc}")
-        return {"account": user, "success": False, "error": str(exc)}
-
-    try:
+        token = refresh_session(s, store, user)
+        log(f"{user}: 已复用并保存原有会话")
         return check_authenticated(s, token, user, today)
     finally:
-        try:
-            response = s.post(BASE + '/api/user/auth/logout',
-                              headers={'Authorization': f'Bearer {token}'}, timeout=20)
-            if response.json().get('success') is not True:
-                log(f'{user}: 会话退出失败 HTTP {response.status_code}，请检查登录会话列表')
-            else:
-                log(f'{user}: 本次登录会话已注销')
-        except (requests.RequestException, ValueError):
-            log(f'{user}: 会话退出请求异常，请检查登录会话列表')
-        finally:
-            s.close()
+        s.close()
 
 
 def check_authenticated(s: requests.Session, token: str, user: str, today: str) -> dict:
@@ -343,10 +309,37 @@ def check_authenticated(s: requests.Session, token: str, user: str, today: str) 
 
 
 def main() -> int:
-    accounts = load_accounts()
-    if not accounts:
-        log("没有可用账号（DGB_ACCOUNTS / DGB_USERNAME* 都为空）")
+    if (os.getenv("DGB_ENABLED") or "").strip().lower() != "true":
+        log("DGB 自动签到已停用；未发起任何认证请求")
+        return 0
+
+    try:
+        from dgb_sessions import SessionStore
+        path = Path(os.getenv("DGB_SESSION_STATE") or str(STATE_DIR / "dgb_sessions.enc"))
+        store = SessionStore(path, os.getenv("DGB_SESSION_KEY") or "", BASE,
+                             os.getenv("DGB_SESSIONS") or "")
+        accounts = load_accounts() or [{"username": user} for user in store.users()]
+        if not accounts:
+            raise RuntimeError("DGB_SESSION_REQUIRED")
+    except (RuntimeError, ImportError) as exc:
+        log(str(exc) if isinstance(exc, RuntimeError) else "DGB_ENCRYPTION_DEPENDENCY_REQUIRED")
         return 2
+
+    if "--prepare" in sys.argv[1:]:
+        try:
+            checkpoint = os.getenv("DGB_CHECKPOINT_ID") or ""
+            today = now_cst().strftime("%Y-%m-%d")
+            rows = history_rows()
+            pending = [acc["username"] for acc in accounts
+                       if SLOT not in ("A", "B") or not already_done(rows, today, SLOT, acc["username"])]
+            errors = store.prepare(pending, checkpoint)
+            for user, error in errors.items():
+                log(f"{user}: {error}")
+            log("已准备加密会话检查点；远端保存成功后才允许刷新")
+            return 0
+        except RuntimeError as exc:
+            log(str(exc))
+            return 2
 
     wait_for_target()
     today = now_cst().strftime("%Y-%m-%d")
@@ -356,7 +349,7 @@ def main() -> int:
     results: list[dict] = []
     for acc in accounts:
         try:
-            res = run_account(acc, today, rows)
+            res = run_account(acc, today, rows, store)
         except Exception as exc:  # noqa: BLE001
             log(f"{acc['username']}: 未预期异常 {type(exc).__name__}: {exc}")
             res = {"account": acc["username"], "success": False,
