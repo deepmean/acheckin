@@ -158,6 +158,9 @@ jobs:
         continue-on-error: true
         env:
           RH_ACCOUNTS: ${{ secrets.RH_ACCOUNTS }}
+          RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
+          RH_TOKEN_KEY: ${{ secrets.RH_TOKEN_KEY }}
+          RH_TOKEN_STATE: state/rh_tokens.enc
           RH_BASE: ${{ vars.RH_BASE || 'https://www.runninghub.ai' }}
           SLOT: ${{ steps.gate.outputs.slot }}
           SLOT_TARGET: ${{ steps.gate.outputs.target }}
@@ -196,7 +199,7 @@ jobs:
           set -e
           git config user.name  "agentrouter-bot"
           git config user.email "agentrouter-bot@users.noreply.github.com"
-          for path in state/history.jsonl state/history_dgb.jsonl state/history_rh.jsonl state/dgb_sessions.enc; do
+          for path in state/history.jsonl state/history_dgb.jsonl state/history_rh.jsonl state/dgb_sessions.enc state/rh_tokens.enc; do
             if [ -f "$path" ]; then git add -- "$path"; fi
           done
           if git diff --cached --quiet; then

@@ -16,6 +16,8 @@ from urllib.parse import urlsplit
 
 import checkin_rh as rh
 
+TEST_KEY = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+
 
 class RhHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
@@ -39,12 +41,22 @@ class RhHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         self.server.paths.append(path)
         size = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(size)
+        self.server.last_body = self.rfile.read(size).decode("utf-8") if size else ""
 
         if path == "/uc/pwdLogin" or path == "/uc/abroad/pwdLogin":
             self.server.login_calls += 1
+            payload = json.loads(self.server.last_body or "{}")
+            email = payload.get("email", "")
+            if email not in self.server.known_emails:
+                self.reply(200, {"code": 123, "msg": "USER_NOT_FOUND", "data": None})
+                return
+            self.server.issued += 1
+            token = f"refresh-new-{self.server.issued}"
+            self.server.valid_refresh[token] = email
+            self.server.access[email] = f"access-{email}"
             self.reply(200, {"code": 0, "msg": "success", "data": {
-                "access_token": "should-not-happen", "refresh_token": "should-not-happen"}})
+                "access_token": f"access-{email}", "refresh_token": token,
+                "expire_in": 2592000000}})
             return
 
         if path == "/uc/token/refresh":
@@ -101,6 +113,9 @@ class RunningHubTests(unittest.TestCase):
         self.server.access = {}
         self.server.granted = {}
         self.server.claim_fails = {}
+        self.server.known_emails = {"a@example.com", "b@example.com"}
+        self.server.issued = 0
+        self.server.last_body = ""
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -193,6 +208,42 @@ class RunningHubTests(unittest.TestCase):
         code, _ = self.run_main()
         self.assertEqual(code, 0)
         self.assertTrue(self.server.granted.get("a@example.com"))
+
+    def test_dead_token_without_password_never_logs_in(self):
+        self.server.valid_refresh.pop("refresh-a")
+        code, text = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.server.login_calls, 0)
+        self.assertIn("重新导入", text)
+
+    def test_password_fallback_runs_once_then_reuses_saved_token(self):
+        self.server.valid_refresh.pop("refresh-a")
+        os.environ["RH_PASSWORD"] = "test-password"
+        os.environ["RH_TOKEN_KEY"] = TEST_KEY
+        os.environ["RH_TOKEN_STATE"] = str(self.root / "tokens.enc")
+
+        code, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.login_calls, 1)
+        self.assertTrue(self.server.granted.get("a@example.com"))
+        ciphertext = (self.root / "tokens.enc").read_bytes()
+        self.assertNotIn(b"refresh-new", ciphertext)
+        self.assertNotIn(b"a@example.com", ciphertext)
+
+        # Next run: the saved token must be used, so no further password login.
+        with patch.object(rh, "SLOT", "B"):
+            code, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.login_calls, 1)
+
+    def test_password_without_token_key_fails_instead_of_logging_in_forever(self):
+        self.server.valid_refresh.pop("refresh-a")
+        os.environ["RH_PASSWORD"] = "test-password"
+        os.environ.pop("RH_TOKEN_KEY", None)
+        code, text = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.server.login_calls, 0)
+        self.assertIn("RH_TOKEN_KEY", text)
 
     def test_malformed_accounts_config_fails_closed(self):
         os.environ["RH_ACCOUNTS"] = '{"not":"a list"}'

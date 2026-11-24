@@ -31,6 +31,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
@@ -223,6 +224,21 @@ def access_token_from(s: requests.Session, refresh_token: str) -> str:
     return access
 
 
+def password_login(s: requests.Session, email: str, password: str) -> tuple[str, str]:
+    """One-off fallback. Returns (access_token, refresh_token)."""
+    body = post_json(s, "/uc/abroad/pwdLogin",
+                     body={"email": email,
+                           "password": hashlib.md5(password.encode()).hexdigest()})
+    if body.get("code") != 0:
+        raise RuntimeError(f"PASSWORD_LOGIN_REJECTED [{body.get('code')}] {body.get('msg') or ''}".strip())
+    data = body.get("data") or {}
+    access = data.get("access_token")
+    refresh = data.get("refresh_token")
+    if not isinstance(access, str) or not access or not isinstance(refresh, str) or not refresh:
+        raise RuntimeError("密码登录成功但未返回令牌")
+    return access, refresh
+
+
 def gift_granted(s: requests.Session, access: str) -> dict:
     body = post_json(s, "/api/welfare/summary", token=access)
     if body.get("code") != 0:
@@ -250,7 +266,37 @@ def point_balance(s: requests.Session, access: str):
 
 
 # ------------------------------- 单账号 --------------------------------- #
-def run_account(acc: dict, today: str, rows: list[dict]) -> dict:
+def resolve_token(email: str, seed_token: str, store) -> str:
+    """A token saved by an earlier password fallback wins over the Secret seed."""
+    if store is not None:
+        saved = store.get(email)
+        if saved:
+            return saved
+    return seed_token
+
+
+def acquire_access(s: requests.Session, email: str, token: str, store) -> tuple[str, str]:
+    """Return (access_token, note). Password is used only when refresh is rejected."""
+    try:
+        return access_token_from(s, token), ""
+    except RuntimeError as exc:
+        if "REFRESH_REJECTED" not in str(exc):
+            raise
+        first_error = str(exc)
+
+    password = (os.getenv("RH_PASSWORD") or "").strip()
+    if not password:
+        raise RuntimeError(f"{first_error}；请重新导入该账号的 refresh_token")
+    if store is None:
+        raise RuntimeError(f"{first_error}；已配置 RH_PASSWORD 但缺少 RH_TOKEN_KEY，"
+                           "没有加密存储会导致每次都重新登录，已停止")
+    access, refresh = password_login(s, email, password)
+    store.set(email, refresh)
+    log(f"{email}: 刷新令牌已失效，用密码兜底登录一次并加密保存新令牌")
+    return access, "password_fallback"
+
+
+def run_account(acc: dict, today: str, rows: list[dict], store=None) -> dict:
     email = acc["email"]
     if SLOT in ("A", "B") and already_done(rows, today, SLOT, email):
         log(f"{email}: 槽位 {SLOT} 今日已完成，跳过")
@@ -259,11 +305,10 @@ def run_account(acc: dict, today: str, rows: list[dict]) -> dict:
     s = new_session()
     try:
         try:
-            access = access_token_from(s, acc["refresh_token"])
+            access, note = acquire_access(
+                s, email, resolve_token(email, acc["refresh_token"], store), store)
         except RuntimeError as exc:
             msg = str(exc)
-            if "REFRESH_REJECTED" in msg:
-                msg += "；请重新导入该账号的 refresh_token"
             log(f"{email}: {msg}")
             return {"account": email, "success": False, "error": msg}
 
@@ -303,6 +348,23 @@ def run_account(acc: dict, today: str, rows: list[dict]) -> dict:
 
 
 # --------------------------------- main -------------------------------- #
+def load_store():
+    """Encrypted token store; only needed when password fallback is configured."""
+    try:
+        from rh_sessions import TokenStore
+    except ImportError:
+        return None
+    key = (os.getenv("RH_TOKEN_KEY") or "").strip()
+    if not key:
+        return None
+    path = Path(os.getenv("RH_TOKEN_STATE") or str(STATE_DIR / "rh_tokens.enc"))
+    try:
+        return TokenStore(path, key)
+    except RuntimeError as exc:
+        log(f"令牌存储不可用：{exc}")
+        raise
+
+
 def main() -> int:
     try:
         accounts = load_accounts()
@@ -314,11 +376,16 @@ def main() -> int:
     today = now_cst().strftime("%Y-%m-%d")
     log(f"开始签到 {BASE} | 账号 {len(accounts)} | 日期 {today} | 槽位 {SLOT}")
 
+    try:
+        store = load_store()
+    except RuntimeError:
+        return 2
+
     rows = history_rows()
     results = []
     for acc in accounts:
         try:
-            res = run_account(acc, today, rows)
+            res = run_account(acc, today, rows, store)
         except Exception as exc:  # noqa: BLE001 单个账号异常不拖垮其他账号
             log(f"{acc['email']}: 未预期异常 {type(exc).__name__}")
             res = {"account": acc["email"], "success": False,

@@ -223,6 +223,39 @@ def wait_for_target() -> None:
         time.sleep(delta)
 
 
+def history_rows() -> list[dict]:
+    if not HISTORY.exists():
+        return []
+    rows = []
+    for line in HISTORY.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def checked_in_today(today: str) -> bool:
+    """该站签到=登录，因此当天成功过一次就不该再登录，避免会话累积。"""
+    return any(r.get("date_cst") == today and r.get("success") for r in history_rows())
+
+
+def release_session(session: requests.Session, uid: str) -> None:
+    """Best-effort logout: keep active sessions from piling up. Never fatal."""
+    try:
+        r = session.post(f"{BASE}/api/user/auth/logout",
+                         headers={"New-Api-User": str(uid)}, json={}, timeout=20)
+        if r.status_code == 200 and (r.json() or {}).get("success"):
+            log("已注销本次登录会话，避免会话累积")
+        else:
+            log(f"注销会话返回 HTTP {r.status_code}，已忽略")
+    except Exception as exc:  # noqa: BLE001
+        log(f"注销会话失败（不影响签到）：{type(exc).__name__}")
+
+
 # ---------------------------------- main ---------------------------------- #
 def main() -> int:
     if not USERNAME or not PASSWORD:
@@ -232,6 +265,17 @@ def main() -> int:
     wait_for_target()
     today = now_cst().strftime("%Y-%m-%d")
     log(f"开始签到 {BASE} | 账号 {USERNAME} | 日期 {today} | 槽位 {SLOT}")
+
+    # 第二时段（或任何再次触发）不再登录：签到即登录，重复登录只会堆会话。
+    if SLOT in ("A", "B") and checked_in_today(today):
+        rec = {"date_cst": today, "ts": now_cst().isoformat(timespec="seconds"),
+               "slot": SLOT, "success": True, "checked_in": True,
+               "verdict": "今日已签到（不重复登录）", "via": "history"}
+        append_history(rec)
+        log("今日已签到，本次不登录")
+        write_step_summary([f"### AgentRouter `{today}`（槽位 {SLOT}）", "",
+                            "- 结论：**今日已签到，未重复登录**（避免会话累积）"])
+        return 0
 
     result, errors = None, []
     for label, proxies in proxy_candidates():
@@ -285,6 +329,7 @@ def main() -> int:
         f"- 时间：{rec['ts']}",
     ])
     tg_notify(f"✅ AgentRouter {today} 槽位{SLOT} {verdict}\n账号 {username}\n额度 {quota_str(quota)}")
+    release_session(result["session"], uid)
     return 0
 
 
