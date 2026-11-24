@@ -59,10 +59,39 @@ ROOT = Path(__file__).resolve().parent
 # 多个站点的历史文件，用逗号分隔；槽位只有在「所有站点都成功」时才算完成，
 # 这样某个站点漏签时，后续 cron 还会继续重试它。
 DGB_ENABLED = (os.getenv("DGB_ENABLED") or "").strip().lower() == "true"
+RH_ENABLED = (os.getenv("RH_ENABLED") or "true").strip().lower() != "false"
+
+
+def _rh_accounts() -> set[str]:
+    """RunningHub 账号（email），来自 RH_ACCOUNTS 的 JSON 数组。"""
+    names: set[str] = set()
+    raw = (os.getenv("RH_ACCOUNTS") or "").strip()
+    if not raw:
+        return names
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return names
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    for item in parsed if isinstance(parsed, list) else []:
+        if isinstance(item, dict):
+            value = item.get("email") or item.get("username")
+            if value:
+                names.add(str(value).strip())
+        elif isinstance(item, str):
+            names.add(item.strip())
+    names.discard("")
+    return names
+
+
+RH_ACCOUNTS = _rh_accounts()
 HISTORY_FILES = [p.strip() for p in
                  (os.getenv("HISTORY_FILES") or "state/history.jsonl").split(",") if p.strip()]
 if not DGB_ENABLED:
     HISTORY_FILES = [p for p in HISTORY_FILES if Path(p).name != "history_dgb.jsonl"]
+if RH_ENABLED and RH_ACCOUNTS and not any(Path(p).name == "history_rh.jsonl" for p in HISTORY_FILES):
+    HISTORY_FILES.append("state/history_rh.jsonl")
 
 
 def offset_minutes(now: dt.datetime) -> int:
@@ -142,6 +171,16 @@ def required_accounts() -> set[str]:
 ACCOUNTS_REQUIRED = required_accounts()
 
 
+def accounts_required_for(rel: str) -> set[str]:
+    """哪个站点要求哪些账号：DGB 看 history_dgb，RunningHub 看 history_rh。"""
+    name = Path(rel).name
+    if name == "history_rh.jsonl":
+        return RH_ACCOUNTS if RH_ENABLED else set()
+    if name == "history_dgb.jsonl":
+        return ACCOUNTS_REQUIRED if DGB_ENABLED else set()
+    return set()
+
+
 def done_slots(rows: list[dict], today: str, by_file: bool = True) -> set[str]:
     """槽位完成 = 每个站点（以及该站点的每个账号）都有一条成功记录。"""
     if not by_file:
@@ -152,16 +191,17 @@ def done_slots(rows: list[dict], today: str, by_file: bool = True) -> set[str]:
         path = (ROOT / rel) if not os.path.isabs(rel) else Path(rel)
         local_rows = [r for r in history_rows(path)
                       if r.get("date_cst") == today and r.get("success") and r.get("slot")]
-        per_account = ACCOUNTS_REQUIRED and any(r.get("account") for r in local_rows)
+        per_account = bool(accounts_required_for(rel)) and any(r.get("account") for r in local_rows)
         if per_account:
+            required = accounts_required_for(rel)
             local = set()
             for slot in {str(r["slot"]) for r in local_rows}:
                 have = {str(r.get("account") or "") for r in local_rows
                         if str(r["slot"]) == slot}
-                if ACCOUNTS_REQUIRED.issubset(have):
+                if required.issubset(have):
                     local.add(slot)
                 else:
-                    miss = sorted(ACCOUNTS_REQUIRED - have - {""})
+                    miss = sorted(required - have - {""})
                     if miss:
                         print(f"[gate] {rel} 槽位 {slot} 还缺账号 {miss}，视为未完成")
         else:
@@ -219,7 +259,8 @@ def main() -> int:
     mode = (os.getenv("SLOT_MODE") or "wait").strip().lower()
     slot_env = (os.getenv("SLOT") or "auto").strip().upper()
 
-    outputs = {"slot": "manual", "target": "", "skip": "0"}
+    outputs = {"slot": "manual", "target": "", "skip": "0",
+               "rh": "1" if (RH_ENABLED and RH_ACCOUNTS) else "0"}
     print(f"[gate] 现在 {now:%Y-%m-%d %H:%M:%S} CST")
     print(f"[gate] 今日计划 {plan_text(now)}")
 

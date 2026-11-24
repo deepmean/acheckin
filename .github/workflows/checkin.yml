@@ -53,6 +53,8 @@ jobs:
           HISTORY_FILES: state/history.jsonl,state/history_dgb.jsonl
           DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
           DGB_ACCOUNTS: ${{ vars.DGB_ACCOUNT_NAMES || '["fjpg5som8g","deepmean"]' }}
+          # RunningHub：gate 只需要邮箱做槽位判定，令牌仅给签到步骤
+          RH_ACCOUNTS: ${{ vars.RH_ACCOUNT_EMAILS || '[]' }}
         run: python gate.py
 
       - name: Install dependencies
@@ -148,21 +150,43 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin_dgb.py
 
+      # RunningHub: refresh-token only. No password is mounted, so daily runs
+      # cannot create new login sessions.
+      - name: Run check-in (RunningHub)
+        id: rh
+        if: ${{ steps.gate.outputs.skip != '1' && steps.gate.outputs.rh == '1' }}
+        continue-on-error: true
+        env:
+          RH_ACCOUNTS: ${{ secrets.RH_ACCOUNTS }}
+          RH_BASE: ${{ vars.RH_BASE || 'https://www.runninghub.ai' }}
+          SLOT: ${{ steps.gate.outputs.slot }}
+          SLOT_TARGET: ${{ steps.gate.outputs.target }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python checkin_rh.py
+
       - name: Verify enabled sites
         if: steps.gate.outputs.skip != '1'
         env:
           AR_OUTCOME: ${{ steps.ar.outcome }}
           DGB_OUTCOME: ${{ steps.dgb.outcome }}
+          RH_OUTCOME: ${{ steps.rh.outcome }}
           DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
+          RH_OUTCOME_EXPECTED: ${{ steps.gate.outputs.rh }}
         run: |
           echo "AgentRouter outcome: $AR_OUTCOME"
           echo "DGB enabled: $DGB_ENABLED; outcome: $DGB_OUTCOME"
+          echo "RunningHub expected: $RH_OUTCOME_EXPECTED; outcome: $RH_OUTCOME"
           if [ "$AR_OUTCOME" != "success" ]; then
             echo "::error::AgentRouter check-in failed"
             exit 1
           fi
           if [ "$DGB_ENABLED" = "true" ] && [ "$DGB_OUTCOME" != "success" ]; then
             echo "::error::DGB existing-session check-in failed"
+            exit 1
+          fi
+          if [ "$RH_OUTCOME_EXPECTED" = "1" ] && [ "$RH_OUTCOME" != "success" ]; then
+            echo "::error::RunningHub check-in failed"
             exit 1
           fi
 
@@ -172,7 +196,7 @@ jobs:
           set -e
           git config user.name  "agentrouter-bot"
           git config user.email "agentrouter-bot@users.noreply.github.com"
-          for path in state/history.jsonl state/history_dgb.jsonl state/dgb_sessions.enc; do
+          for path in state/history.jsonl state/history_dgb.jsonl state/history_rh.jsonl state/dgb_sessions.enc; do
             if [ -f "$path" ]; then git add -- "$path"; fi
           done
           if git diff --cached --quiet; then
