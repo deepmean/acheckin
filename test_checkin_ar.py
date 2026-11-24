@@ -43,6 +43,14 @@ class ArHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/user/auth/logout":
             self.server.logout_calls += 1
+            status = getattr(self.server, "logout_status", 404)
+            if status == 200:
+                self.reply({"success": True, "message": "ok"})
+            else:
+                self.reply({"success": False, "message": "missing"}, status)
+            return
+        if self.path == "/api/user/logout":
+            self.server.logout_calls += 1
             status = getattr(self.server, "logout_status", 200)
             if status == 200:
                 self.reply({"success": True, "message": "ok"})
@@ -100,7 +108,14 @@ class AgentRouterLoginTests(unittest.TestCase):
         code, _ = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual(self.server.login_calls, 1)
-        self.assertEqual(self.server.logout_calls, 1)
+        self.assertEqual(self.server.logout_calls, 2)  # first path 404, fallback succeeds
+
+    def test_logout_failure_does_not_fail_the_check_in(self):
+        self.server.logout_status = 500
+        code, text = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.login_calls, 1)
+        self.assertIn("未提供可用的注销接口", text)
 
     def test_second_slot_same_day_does_not_log_in_again(self):
         self.assertEqual(self.run_main()[0], 0)
@@ -116,9 +131,10 @@ class AgentRouterLoginTests(unittest.TestCase):
 
     def test_logout_failure_does_not_fail_the_check_in(self):
         self.server.logout_status = 500
-        code, _ = self.run_main()
+        code, text = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual(self.server.login_calls, 1)
+        self.assertIn("未提供可用的注销接口", text)
 
 
 if __name__ == "__main__":

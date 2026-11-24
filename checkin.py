@@ -243,17 +243,22 @@ def checked_in_today(today: str) -> bool:
     return any(r.get("date_cst") == today and r.get("success") for r in history_rows())
 
 
+LOGOUT_PATHS = ("/api/user/auth/logout", "/api/user/logout")
+
+
 def release_session(session: requests.Session, uid: str) -> None:
-    """Best-effort logout: keep active sessions from piling up. Never fatal."""
-    try:
-        r = session.post(f"{BASE}/api/user/auth/logout",
-                         headers={"New-Api-User": str(uid)}, json={}, timeout=20)
-        if r.status_code == 200 and (r.json() or {}).get("success"):
-            log("已注销本次登录会话，避免会话累积")
-        else:
-            log(f"注销会话返回 HTTP {r.status_code}，已忽略")
-    except Exception as exc:  # noqa: BLE001
-        log(f"注销会话失败（不影响签到）：{type(exc).__name__}")
+    """Best-effort logout so active sessions do not pile up. Never fatal."""
+    for path in LOGOUT_PATHS:
+        try:
+            r = session.post(f"{BASE}{path}",
+                             headers={"New-Api-User": str(uid)}, json={}, timeout=20)
+            if r.status_code == 200 and (r.json() or {}).get("success"):
+                log(f"已注销本次登录会话（{path}），避免会话累积")
+                return
+            log(f"注销 {path} 返回 HTTP {r.status_code}，继续尝试下一个")
+        except Exception as exc:  # noqa: BLE001
+            log(f"注销 {path} 失败：{type(exc).__name__}")
+    log("站点未提供可用的注销接口，本次会话保持（每日最多一次登录）")
 
 
 # ---------------------------------- main ---------------------------------- #
