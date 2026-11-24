@@ -12,6 +12,7 @@
 | --- | --- | --- | --- |
 | AgentRouter（agentrouter.org） | `checkin.py` | `state/history.jsonl` | Cloudflare WARP |
 | DGB 公益站（freeapi.dgbmc.top） | `checkin_dgb.py` | `state/history_dgb.jsonl` | 直连 |
+| RunningHub（www.runninghub.ai） | `checkin_rh.py` | `state/history_rh.jsonl` | 直连 |
 
 ```
 gate.py                        槽位闸门：算当天随机时间，作业内精确等待（纯标准库）
@@ -72,6 +73,40 @@ DGB 自动签到默认关闭，AgentRouter 独立运行。
 
 安装依赖后执行 `python -m unittest discover -v`，使用本地 HTTP 服务验证：默认停用零请求、
 连续同 SID 刷新、轮换持久化、异常隔离以及缺少会话时零密码登录。所有测试使用虚拟凭据。
+
+## RunningHub（www.runninghub.ai）每日积分
+
+每天 30 POINT，北京时间 00:00 重置。**密码只在一次性初始化时使用，日常运行只用 refresh_token。**
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /uc/abroad/pwdLogin` | 一次性初始化：`{email, password}`，password 为 32 位 MD5；返回 `access_token` + `refresh_token`（30 天） |
+| `POST /uc/token/refresh` | 头 `Authorization: Bearer <refresh_token>` 换取新 access；实测**非轮换**，旧 refresh 仍可用 |
+| `POST /api/welfare/summary` | 读 `data.dailyGift.granted` 判断今日是否已领 |
+| `POST /api/welfare/daily-gift/claim` | 领取；首次 `data=true`，重复 `data=false` 且余额不变（服务端幂等） |
+| `POST /uc/point/summary` / `gainList` | 积分余额与发放记录 |
+
+### 配置
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `RH_ACCOUNTS` | Secret | `[{"email":"...","refresh_token":"..."}, ...]`，9 个账号 |
+| `RH_ACCOUNT_EMAILS` | Variable | 仅邮箱的 JSON 数组，供 `gate.py` 做槽位完成判定（不含令牌） |
+| `RH_BASE` | Variable | 可选，默认 `https://www.runninghub.ai` |
+
+### 一次性初始化
+
+`bootstrap_rh.py` 在**本机**运行（不进 Actions），用密码为每个账号换取 refresh_token 并写入本地文件，
+再导入成 `RH_ACCOUNTS`。之后工作流不再挂载任何 RunningHub 密码。
+
+### 调度与去重
+
+RunningHub 与 AgentRouter 共用同一套随机槽位：每天两个随机时间、间隔 12 小时、分钟避开整点。
+`gate.py` 要求**当天同一槽位的全部 9 个账号**都有成功记录，槽位才算完成；因此某个账号失败时，
+下一条 cron 会继续补签。第二个槽位拿到「今日已领取」也会记一条成功记录，用于兜底确认。
+
+- 令牌缺失、格式错误或刷新被拒时，该账号单独失败并提示重新导入，**不会回退到密码登录**。
+- 所有请求禁用重定向，避免 3xx 被自动转发到登录端点。
 
 ## 一、AgentRouter 站点签到机制（2026-10 实测）
 

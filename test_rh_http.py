@@ -185,6 +185,15 @@ class RunningHubTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(self.server.paths, [])
 
+    def test_base64_accounts_config_is_accepted(self):
+        import base64
+        payload = base64.b64encode(json.dumps(
+            [{"email": "a@example.com", "refresh_token": "refresh-a"}]).encode()).decode()
+        os.environ["RH_ACCOUNTS"] = payload
+        code, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertTrue(self.server.granted.get("a@example.com"))
+
     def test_malformed_accounts_config_fails_closed(self):
         os.environ["RH_ACCOUNTS"] = '{"not":"a list"}'
         code, _ = self.run_main()

@@ -63,24 +63,38 @@ RH_ENABLED = (os.getenv("RH_ENABLED") or "true").strip().lower() != "false"
 
 
 def _rh_accounts() -> set[str]:
-    """RunningHub 账号（email），来自 RH_ACCOUNTS 的 JSON 数组。"""
+    """RunningHub 账号（email）。
+
+    接受三种写法，避免仓库变量被 shell 吃掉引号后失效：
+      JSON 数组  ["a@x","b@y"]
+      逗号分隔   a@x,b@y
+      换行分隔
+    """
     names: set[str] = set()
     raw = (os.getenv("RH_ACCOUNTS") or "").strip()
     if not raw:
         return names
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return names
+    parsed = None
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
     if isinstance(parsed, dict):
         parsed = [parsed]
-    for item in parsed if isinstance(parsed, list) else []:
-        if isinstance(item, dict):
-            value = item.get("email") or item.get("username")
-            if value:
-                names.add(str(value).strip())
-        elif isinstance(item, str):
-            names.add(item.strip())
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict):
+                value = item.get("email") or item.get("username")
+                if value:
+                    names.add(str(value).strip())
+            elif isinstance(item, str):
+                names.add(item.strip())
+    else:
+        for chunk in raw.replace("\n", ",").split(","):
+            value = chunk.strip().strip('"').strip("'")
+            if value and not value.startswith("{"):
+                names.add(value)
     names.discard("")
     return names
 

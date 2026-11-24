@@ -51,6 +51,15 @@ class GateSiteSelectionTests(unittest.TestCase):
                     stream.write(json.dumps(dict(record, account="b@example.com")) + "\n")
                 self.assertEqual(module.done_slots(module.all_rows(), "2026-11-17"), {"A"})
 
+    def test_runninghub_accepts_comma_separated_accounts(self):
+        env = {"HISTORY_FILES": "state/history.jsonl", "DGB_ENABLED": "false",
+               "RH_ACCOUNTS": "a@example.com,b@example.com"}
+        with patch.dict(os.environ, env, clear=True):
+            spec = importlib.util.spec_from_file_location("rh_gate3", Path(__file__).with_name("gate.py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertEqual(module.RH_ACCOUNTS, {"a@example.com", "b@example.com"})
+
     def test_runninghub_is_ignored_when_no_accounts_configured(self):
         with tempfile.TemporaryDirectory() as directory:
             ar = Path(directory) / "history.jsonl"

@@ -28,6 +28,8 @@ Environment
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import json
 import os
@@ -63,10 +65,21 @@ def log(msg: str) -> None:
 
 
 def load_accounts() -> list[dict]:
-    """Parse RH_ACCOUNTS; any malformed value fails closed (no requests)."""
+    """Parse RH_ACCOUNTS; any malformed value fails closed (no requests).
+
+    Accepts plain JSON, or base64-encoded JSON (safer to pass through shells
+    and CI variables that would otherwise eat the quotes).
+    """
     raw = (os.getenv("RH_ACCOUNTS") or "").strip()
     if not raw:
         raise RuntimeError("RH_ACCOUNTS 为空：请导入 refresh_token")
+    if not raw.startswith(("[", "{")):
+        try:
+            decoded = base64.b64decode(raw, validate=True).decode("utf-8")
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            decoded = ""
+        if decoded.lstrip().startswith(("[", "{")):
+            raw = decoded
     try:
         parsed = json.loads(raw)
     except ValueError:
