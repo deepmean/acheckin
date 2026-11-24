@@ -104,15 +104,22 @@ class AgentRouterLoginTests(unittest.TestCase):
             code = checkin.main()
         return code, out.getvalue()
 
-    def test_login_then_logout_releases_the_session(self):
+    def test_no_logout_requests_by_default(self):
         code, _ = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual(self.server.login_calls, 1)
-        self.assertEqual(self.server.logout_calls, 2)  # first path 404, fallback succeeds
+        self.assertEqual(self.server.logout_calls, 0)
+
+    def test_opt_in_logout_tries_both_paths(self):
+        with patch.dict(os.environ, {"AR_LOGOUT": "1"}):
+            code, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.logout_calls, 2)  # first 404, second succeeds
 
     def test_logout_failure_does_not_fail_the_check_in(self):
         self.server.logout_status = 500
-        code, text = self.run_main()
+        with patch.dict(os.environ, {"AR_LOGOUT": "1"}):
+            code, text = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual(self.server.login_calls, 1)
         self.assertIn("未提供可用的注销接口", text)
@@ -128,13 +135,6 @@ class AgentRouterLoginTests(unittest.TestCase):
                 (self.root / "history.jsonl").read_text("utf-8").splitlines() if line.strip()]
         self.assertEqual({r["slot"] for r in rows}, {"A", "B"})
         self.assertTrue(all(r["success"] for r in rows))
-
-    def test_logout_failure_does_not_fail_the_check_in(self):
-        self.server.logout_status = 500
-        code, text = self.run_main()
-        self.assertEqual(code, 0)
-        self.assertEqual(self.server.login_calls, 1)
-        self.assertIn("未提供可用的注销接口", text)
 
 
 if __name__ == "__main__":

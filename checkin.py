@@ -247,15 +247,17 @@ LOGOUT_PATHS = ("/api/user/auth/logout", "/api/user/logout")
 
 
 def release_session(session: requests.Session, uid: str) -> None:
-    """Best-effort logout so active sessions do not pile up. Never fatal."""
+    """Optional logout. Measured 2026-11-24: both known paths return 404, so this
+    stays opt-in (AR_LOGOUT=1) instead of costing requests on every run."""
+    if (os.getenv("AR_LOGOUT") or "").strip() not in ("1", "true"):
+        return
     for path in LOGOUT_PATHS:
         try:
             r = session.post(f"{BASE}{path}",
                              headers={"New-Api-User": str(uid)}, json={}, timeout=20)
             if r.status_code == 200 and (r.json() or {}).get("success"):
-                log(f"已注销本次登录会话（{path}），避免会话累积")
+                log(f"已注销本次登录会话（{path}）")
                 return
-            log(f"注销 {path} 返回 HTTP {r.status_code}，继续尝试下一个")
         except Exception as exc:  # noqa: BLE001
             log(f"注销 {path} 失败：{type(exc).__name__}")
     log("站点未提供可用的注销接口，本次会话保持（每日最多一次登录）")
