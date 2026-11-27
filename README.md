@@ -13,6 +13,7 @@
 | AgentRouter（agentrouter.org） | `checkin.py` | `state/history.jsonl` | Cloudflare WARP |
 | DGB 公益站（freeapi.dgbmc.top） | `checkin_dgb.py` | `state/history_dgb.jsonl` | 直连 |
 | RunningHub（www.runninghub.ai） | `checkin_rh.py` | `state/history_rh.jsonl` | 直连 |
+| Mengzhiji（mengzhiji.net） | `checkin_mzj.py` | `state/history_mzj.jsonl` | 直连 |
 
 ```
 gate.py                        槽位闸门：算当天随机时间，作业内精确等待（纯标准库）
@@ -119,6 +120,24 @@ RunningHub 与 AgentRouter 共用同一套随机槽位：每天两个随机时�
 - 当天已有成功记录时，后续槽位直接记一条成功并跳过登录（`checked_in_today`）。
 - 只有当天首次执行、或此前失败时才真正登录，从而把会话增速从 2/天 降到 1/天。
 - 站点按 IP 限流（429）并对数据中心出口返回 WAF 挑战页，因此不做额外探测请求。
+
+## Mengzhiji（mengzhiji.net）每日签到
+
+每日登录 Cookie 保存在 `MZJ_SESSIONS`，日常先复用 HttpOnly 会话：
+`GET /api/rewards/daily-checkin` 检查 `claimedToday`，未领取时才 `POST` 同一路径。
+重复领取由服务端标记，调度端仍按账号+槽位去重。站点没有 refresh token；当前 Cookie 有约 14 天有效期。
+
+| 配置 | 类型 | 说明 |
+| --- | --- | --- |
+| `MZJ_ACCOUNTS` | Secret | base64 JSON 数组：`[{"email":"...","password":"..."}, ...]`；密码仅在会话 401 后兜底使用 |
+| `MZJ_SESSIONS` | Secret | base64 JSON 映射 `{email: novel_session_cookie}`，初始 Cookie |
+| `MZJ_SESSION_KEY` | Secret | Fernet 密钥，兜底登录签发的新 Cookie 加密后保存 |
+| `MZJ_ACCOUNT_EMAILS` | Variable | 两个邮箱的逗号分隔列表，用于 gate 槽位完成判定 |
+| `MZJ_BASE` | Variable | 默认 `https://api.mengzhiji.net` |
+
+密码兜底只在 `/api/auth/me` 明确返回 401 时发生；429、403、网络错误不会触发登录。
+兜底后的会话写入 `state/mzj_sessions.enc`（密文），原始 Cookie 和密码不进入日志或历史文件。
+每天与 AgentRouter 共用两个随机槽位、间隔 12 小时、分钟避开整点；只有该槽位两个账号都成功才算完成。
 
 ## 一、AgentRouter 站点签到机制（2026-10 实测）
 
