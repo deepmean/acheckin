@@ -74,6 +74,26 @@ class GateSiteSelectionTests(unittest.TestCase):
                 self.assertEqual([Path(p).name for p in module.HISTORY_FILES], ["history.jsonl"])
                 self.assertEqual(module.done_slots(module.all_rows(), "2026-11-17"), {"A"})
 
+    def test_mengzhiji_slot_requires_all_accounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ar = Path(directory) / "history.jsonl"
+            mzj = Path(directory) / "history_mzj.jsonl"
+            record = {"date_cst": "2026-11-17", "slot": "A", "success": True,
+                      "ts": "2026-11-17T05:00:00+08:00"}
+            ar.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            mzj.write_text(json.dumps(dict(record, account="a@example.com")) + "\n", encoding="utf-8")
+            env = {"HISTORY_FILES": f"{ar},{mzj}", "DGB_ENABLED": "false",
+                   "RH_ACCOUNTS": "", "MZJ_ACCOUNT_EMAILS": "a@example.com,b@example.com"}
+            with patch.dict(os.environ, env, clear=True):
+                spec = importlib.util.spec_from_file_location("mzj_gate", Path(__file__).with_name("gate.py"))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.assertIn(str(mzj), module.HISTORY_FILES)
+                self.assertEqual(module.done_slots(module.all_rows(), "2026-11-17"), set())
+                with mzj.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(dict(record, account="b@example.com")) + "\n")
+                self.assertEqual(module.done_slots(module.all_rows(), "2026-11-17"), {"A"})
+
     def test_enabled_gate_requires_all_plain_username_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             ar = Path(directory) / "history.jsonl"

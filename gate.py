@@ -60,6 +60,7 @@ ROOT = Path(__file__).resolve().parent
 # 这样某个站点漏签时，后续 cron 还会继续重试它。
 DGB_ENABLED = (os.getenv("DGB_ENABLED") or "").strip().lower() == "true"
 RH_ENABLED = (os.getenv("RH_ENABLED") or "true").strip().lower() != "false"
+MZJ_ENABLED = (os.getenv("MZJ_ENABLED") or "true").strip().lower() != "false"
 
 
 def _rh_accounts() -> set[str]:
@@ -100,12 +101,33 @@ def _rh_accounts() -> set[str]:
 
 
 RH_ACCOUNTS = _rh_accounts()
+
+
+def _mzj_accounts() -> set[str]:
+    """Mengzhiji email list; accept JSON or comma/newline separated values."""
+    raw = (os.getenv("MZJ_ACCOUNT_EMAILS") or "").strip()
+    if not raw:
+        return set()
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return {str(value).strip() for value in parsed if str(value).strip()}
+        except ValueError:
+            pass
+    return {part.strip().strip('"').strip("'")
+            for part in raw.replace("\n", ",").split(",") if part.strip()}
+
+
+MZJ_ACCOUNTS = _mzj_accounts()
 HISTORY_FILES = [p.strip() for p in
                  (os.getenv("HISTORY_FILES") or "state/history.jsonl").split(",") if p.strip()]
 if not DGB_ENABLED:
     HISTORY_FILES = [p for p in HISTORY_FILES if Path(p).name != "history_dgb.jsonl"]
 if RH_ENABLED and RH_ACCOUNTS and not any(Path(p).name == "history_rh.jsonl" for p in HISTORY_FILES):
     HISTORY_FILES.append("state/history_rh.jsonl")
+if MZJ_ENABLED and MZJ_ACCOUNTS and not any(Path(p).name == "history_mzj.jsonl" for p in HISTORY_FILES):
+    HISTORY_FILES.append("state/history_mzj.jsonl")
 
 
 def offset_minutes(now: dt.datetime) -> int:
@@ -190,6 +212,8 @@ def accounts_required_for(rel: str) -> set[str]:
     name = Path(rel).name
     if name == "history_rh.jsonl":
         return RH_ACCOUNTS if RH_ENABLED else set()
+    if name == "history_mzj.jsonl":
+        return MZJ_ACCOUNTS if MZJ_ENABLED else set()
     if name == "history_dgb.jsonl":
         return ACCOUNTS_REQUIRED if DGB_ENABLED else set()
     return set()
@@ -274,7 +298,8 @@ def main() -> int:
     slot_env = (os.getenv("SLOT") or "auto").strip().upper()
 
     outputs = {"slot": "manual", "target": "", "skip": "0",
-               "rh": "1" if (RH_ENABLED and RH_ACCOUNTS) else "0"}
+               "rh": "1" if (RH_ENABLED and RH_ACCOUNTS) else "0",
+               "mzj": "1" if (MZJ_ENABLED and MZJ_ACCOUNTS) else "0"}
     print(f"[gate] 现在 {now:%Y-%m-%d %H:%M:%S} CST")
     print(f"[gate] 今日计划 {plan_text(now)}")
 

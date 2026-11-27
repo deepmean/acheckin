@@ -55,6 +55,7 @@ jobs:
           DGB_ACCOUNTS: ${{ vars.DGB_ACCOUNT_NAMES || '["fjpg5som8g","deepmean"]' }}
           # RunningHub：gate 只需要邮箱做槽位判定，令牌仅给签到步骤
           RH_ACCOUNTS: ${{ vars.RH_ACCOUNT_EMAILS || '[]' }}
+          MZJ_ACCOUNT_EMAILS: ${{ vars.MZJ_ACCOUNT_EMAILS || '' }}
         run: python gate.py
 
       - name: Install dependencies
@@ -168,18 +169,37 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin_rh.py
 
+      - name: Run check-in (Mengzhiji)
+        id: mzj
+        if: ${{ steps.gate.outputs.skip != '1' && steps.gate.outputs.mzj == '1' }}
+        continue-on-error: true
+        env:
+          MZJ_ACCOUNTS: ${{ secrets.MZJ_ACCOUNTS }}
+          MZJ_SESSIONS: ${{ secrets.MZJ_SESSIONS }}
+          MZJ_SESSION_KEY: ${{ secrets.MZJ_SESSION_KEY }}
+          MZJ_SESSION_STATE: state/mzj_sessions.enc
+          MZJ_BASE: ${{ vars.MZJ_BASE || 'https://api.mengzhiji.net' }}
+          SLOT: ${{ steps.gate.outputs.slot }}
+          SLOT_TARGET: ${{ steps.gate.outputs.target }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python checkin_mzj.py
+
       - name: Verify enabled sites
         if: steps.gate.outputs.skip != '1'
         env:
           AR_OUTCOME: ${{ steps.ar.outcome }}
           DGB_OUTCOME: ${{ steps.dgb.outcome }}
           RH_OUTCOME: ${{ steps.rh.outcome }}
+          MZJ_OUTCOME: ${{ steps.mzj.outcome }}
           DGB_ENABLED: ${{ vars.DGB_ENABLED || 'false' }}
           RH_OUTCOME_EXPECTED: ${{ steps.gate.outputs.rh }}
+          MZJ_OUTCOME_EXPECTED: ${{ steps.gate.outputs.mzj }}
         run: |
           echo "AgentRouter outcome: $AR_OUTCOME"
           echo "DGB enabled: $DGB_ENABLED; outcome: $DGB_OUTCOME"
           echo "RunningHub expected: $RH_OUTCOME_EXPECTED; outcome: $RH_OUTCOME"
+          echo "Mengzhiji expected: $MZJ_OUTCOME_EXPECTED; outcome: $MZJ_OUTCOME"
           if [ "$AR_OUTCOME" != "success" ]; then
             echo "::error::AgentRouter check-in failed"
             exit 1
@@ -192,6 +212,10 @@ jobs:
             echo "::error::RunningHub check-in failed"
             exit 1
           fi
+          if [ "$MZJ_OUTCOME_EXPECTED" = "1" ] && [ "$MZJ_OUTCOME" != "success" ]; then
+            echo "::error::Mengzhiji check-in failed"
+            exit 1
+          fi
 
       - name: Persist history
         if: always()
@@ -199,7 +223,7 @@ jobs:
           set -e
           git config user.name  "agentrouter-bot"
           git config user.email "agentrouter-bot@users.noreply.github.com"
-          for path in state/history.jsonl state/history_dgb.jsonl state/history_rh.jsonl state/dgb_sessions.enc state/rh_tokens.enc; do
+          for path in state/history.jsonl state/history_dgb.jsonl state/history_rh.jsonl state/history_mzj.jsonl state/dgb_sessions.enc state/rh_tokens.enc state/mzj_sessions.enc; do
             if [ -f "$path" ]; then git add -- "$path"; fi
           done
           if git diff --cached --quiet; then
